@@ -36,7 +36,8 @@ require_once 'CashuWallet.php';
 
 use Cashu\Wallet;
 
-$wallet = new Wallet('https://testnut.cashu.space', 'sat');
+// IMPORTANT: Always use SQLite storage (third parameter)
+$wallet = new Wallet('https://testnut.cashu.space', 'sat', '/path/to/wallet.db');
 $wallet->loadMint();
 $seedPhrase = $wallet->generateMnemonic();
 
@@ -52,6 +53,7 @@ while (!$wallet->checkMintQuote($quote->quote)->isPaid()) {
     sleep(5);
 }
 $proofs = $wallet->mint($quote->quote, 100);
+// Proofs and counters automatically stored in database
 ```
 
 ## Interactive Test Wallet
@@ -83,7 +85,14 @@ The test wallet provides a menu-driven interface to:
 - `ext-gmp` (recommended) OR `ext-bcmath` for big integer math
 - `ext-curl` for HTTP requests
 - `ext-json` (standard)
+- `ext-pdo_sqlite` for SQLite storage (**STRONGLY RECOMMENDED**)
 - `bip39-english.txt` wordlist file (for mnemonic support)
+
+## ⚠️ Important: Use SQLite Storage
+
+**Always use SQLite storage in production!** Without it, deterministic counters reset on script restart, which can lead to duplicate secrets and rejected transactions. See [USAGE.md](USAGE.md) for details.
+
+Recovery from seed is possible but slow. SQLite provides instant counter persistence and crash recovery.
 
 ## ⚠️ Security Warnings
 

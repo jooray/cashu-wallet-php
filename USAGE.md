@@ -26,7 +26,65 @@ This single-file PHP library (`CashuWallet.php`) provides:
 - `ext-gmp` (recommended) OR `ext-bcmath` for big integer math
 - `ext-curl` for HTTP requests
 - `ext-json` (standard)
+- `ext-pdo_sqlite` for SQLite storage (**STRONGLY RECOMMENDED**)
 - `bip39-english.txt` wordlist file (for mnemonic support)
+
+## ⚠️ CRITICAL: Always Use SQLite Storage
+
+**YOU MUST USE SQLITE STORAGE OR YOU WILL LOSE FUNDS**
+
+The wallet uses deterministic counters to generate unique secrets for each proof. Without SQLite storage:
+
+1. **Counters are stored in memory only** - they reset to 0 every time your script restarts
+2. **After restart, the wallet generates duplicate secrets** - same counter = same secret
+3. **Duplicate secrets are rejected by the mint** - the mint sees them as already used
+4. **Your tokens become unspendable** - you cannot mint new tokens or the mint rejects them
+
+**Example of the problem:**
+```php
+// WITHOUT STORAGE - DANGEROUS!
+$wallet = new Wallet('https://mint.example.com', 'sat');  // NO DATABASE!
+$wallet->loadMint();
+$wallet->initFromMnemonic('your seed phrase');
+
+// First run: mints proofs with counters 0,1,2,3,4,5
+$proofs = $wallet->mint($quote1->quote, 100);
+
+// Script ends, counters reset to 0
+
+// Second run: tries to mint with counters 0,1,2,3,4,5 AGAIN
+$proofs = $wallet->mint($quote2->quote, 200);
+// ERROR: Mint rejects duplicate secrets! Tokens are LOST!
+```
+
+**Solution: ALWAYS provide a database path:**
+```php
+// CORRECT - WITH STORAGE
+$wallet = new Wallet('https://mint.example.com', 'sat', '/path/to/wallet.db');
+// Counters are persisted, never reset, tokens are safe
+```
+
+### When is it safe to skip SQLite storage?
+
+**Almost never in production.** There are limited cases:
+
+1. **Testing only** - If you:
+   - Use test mints only
+   - Use tiny amounts you can afford to lose
+   - Never restart the script between operations
+
+2. **With immediate restoration** - If you:
+   - ALWAYS restore from seed before any operations
+   - Call `$wallet->restore()` on every script start
+   - Are willing to wait for slow restore scans
+   - Check proof states with `syncProofStates()` regularly
+
+**However, even with restoration, SQLite is strongly recommended because:**
+- Restore scans are slow (can take minutes)
+- You avoid the risk of forgetting to restore
+- Counters are immediately available
+- Crash recovery is built-in
+- Much better user experience
 
 ## Quick Start
 
@@ -42,8 +100,8 @@ use Cashu\CashuException;
 ### Basic Example: Mint, Send, and Receive
 
 ```php
-// 1. Create wallet and connect to mint
-$wallet = new Wallet('https://testnut.cashu.space', 'sat');
+// 1. Create wallet with SQLite storage (CRITICAL!)
+$wallet = new Wallet('https://testnut.cashu.space', 'sat', '/path/to/wallet.db');
 $wallet->loadMint();
 
 // 2. Initialize with seed (REQUIRED for recoverable tokens)
@@ -59,16 +117,18 @@ while (!$wallet->checkMintQuote($quote->quote)->isPaid()) {
     sleep(5);
 }
 $proofs = $wallet->mint($quote->quote, 100);
+// Proofs are automatically stored in database
 
 // 5. Serialize to send
 $tokenString = $wallet->serializeToken($proofs, 'v4');
 echo "Token to send: $tokenString\n";
 
 // 6. Receive on another wallet
-$receiverWallet = new Wallet('https://testnut.cashu.space', 'sat');
+$receiverWallet = new Wallet('https://testnut.cashu.space', 'sat', '/path/to/receiver.db');
 $receiverWallet->loadMint();
 $receiverWallet->generateMnemonic();
 $newProofs = $receiverWallet->receive($tokenString);
+// New proofs are automatically stored
 ```
 
 ## Core Concepts
@@ -128,8 +188,8 @@ The library supports multiple currency units:
 | btc  | 8        | 0.00000100 |
 
 ```php
-// Create wallet for specific unit
-$wallet = new Wallet('https://mint.example.com', 'usd');
+// Create wallet for specific unit (with storage!)
+$wallet = new Wallet('https://mint.example.com', 'usd', '/path/to/wallet.db');
 
 // Format amounts
 echo $wallet->formatAmount(150); // "$1.50"
@@ -152,7 +212,8 @@ Convert Lightning payments into Cashu tokens:
 use Cashu\Wallet;
 use Cashu\CashuException;
 
-$wallet = new Wallet('https://testnut.cashu.space');
+// ALWAYS use SQLite storage!
+$wallet = new Wallet('https://testnut.cashu.space', 'sat', '/path/to/wallet.db');
 $wallet->loadMint();
 
 // 1. Initialize seed (REQUIRED)
@@ -184,13 +245,13 @@ if (!$paid) {
 
 // 4. Mint tokens
 $proofs = $wallet->mint($quote->quote, $amount);
+// Proofs and counters automatically stored in database
 
 echo "Minted " . count($proofs) . " proofs\n";
 echo "Total: " . Wallet::sumProofs($proofs) . " sat\n";
 
-// 5. Serialize for storage or sharing
-$token = $wallet->serializeToken($proofs, 'v4');
-echo "Token: $token\n";
+// 5. Get balance from storage
+echo "Current balance: " . $wallet->formatAmount($wallet->getBalance()) . "\n";
 ```
 
 ### Sending Tokens
@@ -199,20 +260,19 @@ Split proofs to send a specific amount:
 
 ```php
 use Cashu\Wallet;
-use Cashu\Proof;
 use Cashu\InsufficientBalanceException;
 
-// Load existing proofs (from storage)
-$proofsData = json_decode(file_get_contents('proofs.json'), true);
-$proofs = array_map(fn($p) => Proof::fromArray($p), $proofsData);
-
-$wallet = new Wallet('https://testnut.cashu.space');
+// Create wallet with storage
+$wallet = new Wallet('https://testnut.cashu.space', 'sat', '/path/to/wallet.db');
 $wallet->loadMint();
 $wallet->initFromMnemonic('your seed phrase here');
 
-// Check balance
-$balance = Wallet::sumProofs($proofs);
-echo "Balance: $balance sat\n";
+// Check balance (from storage)
+$balance = $wallet->getBalance();
+echo "Balance: " . $wallet->formatAmount($balance) . "\n";
+
+// Load proofs from storage
+$proofs = $wallet->getStoredProofs();
 
 $sendAmount = 50;
 
@@ -224,17 +284,15 @@ try {
     $keepProofs = $result['keep'];  // Change to keep
     $fee = $result['fee'];          // Fee paid
 
-    echo "Send: " . Wallet::sumProofs($sendProofs) . " sat\n";
-    echo "Keep: " . Wallet::sumProofs($keepProofs) . " sat\n";
-    echo "Fee: $fee sat\n";
+    echo "Send: " . $wallet->formatAmount(Wallet::sumProofs($sendProofs)) . "\n";
+    echo "Keep: " . $wallet->formatAmount(Wallet::sumProofs($keepProofs)) . "\n";
+    echo "Fee: " . $wallet->formatAmount($fee) . "\n";
 
     // Serialize for sending
     $tokenToSend = $wallet->serializeToken($sendProofs, 'v4');
     echo "Token to send: $tokenToSend\n";
 
-    // Save remaining proofs
-    $keepJson = json_encode(array_map(fn($p) => $p->toArray(true), $keepProofs));
-    file_put_contents('proofs.json', $keepJson);
+    // Proofs are automatically updated in storage after split
 
 } catch (InsufficientBalanceException $e) {
     echo "Not enough balance: " . $e->getMessage() . "\n";
@@ -258,8 +316,8 @@ echo "Mint: " . $token->mint . "\n";
 echo "Unit: " . $token->unit . "\n";
 echo "Amount: " . $token->getAmount() . " " . $token->unit . "\n";
 
-// Create wallet for the token's mint and unit
-$wallet = new Wallet($token->mint, $token->unit);
+// Create wallet for the token's mint and unit (with storage!)
+$wallet = new Wallet($token->mint, $token->unit, '/path/to/wallet.db');
 $wallet->loadMint();
 
 // Initialize with your seed
@@ -276,13 +334,11 @@ foreach ($states as $state) {
 // Receive (swap for fresh proofs)
 try {
     $newProofs = $wallet->receive($tokenString);
+    // New proofs automatically stored in database
 
     echo "Received " . count($newProofs) . " proofs\n";
     echo "Total: " . Wallet::sumProofs($newProofs) . " " . $token->unit . "\n";
-
-    // Save your new proofs
-    $json = json_encode(array_map(fn($p) => $p->toArray(true), $newProofs));
-    file_put_contents('proofs.json', $json);
+    echo "New balance: " . $wallet->formatAmount($wallet->getBalance()) . "\n";
 
 } catch (CashuException $e) {
     echo "Failed to receive: " . $e->getMessage() . "\n";
@@ -295,25 +351,24 @@ Pay a Lightning invoice using Cashu tokens:
 
 ```php
 use Cashu\Wallet;
-use Cashu\Proof;
 use Cashu\InsufficientBalanceException;
 
 $invoice = 'lnbc100n1p...'; // Lightning invoice to pay
 
-// Load proofs
-$proofsData = json_decode(file_get_contents('proofs.json'), true);
-$proofs = array_map(fn($p) => Proof::fromArray($p), $proofsData);
-
-$wallet = new Wallet('https://testnut.cashu.space');
+// Create wallet with storage
+$wallet = new Wallet('https://testnut.cashu.space', 'sat', '/path/to/wallet.db');
 $wallet->loadMint();
 $wallet->initFromMnemonic('your seed phrase here');
+
+// Load proofs from storage
+$proofs = $wallet->getStoredProofs();
 
 // 1. Get melt quote (shows fees)
 $quote = $wallet->requestMeltQuote($invoice);
 
-echo "Amount: " . $quote->amount . " sat\n";
-echo "Fee Reserve: " . $quote->feeReserve . " sat\n";
-echo "Total needed: " . ($quote->amount + $quote->feeReserve) . " sat\n";
+echo "Amount: " . $wallet->formatAmount($quote->amount) . "\n";
+echo "Fee Reserve: " . $wallet->formatAmount($quote->feeReserve) . "\n";
+echo "Total needed: " . $wallet->formatAmount($quote->amount + $quote->feeReserve) . "\n";
 
 $totalNeeded = $quote->amount + $quote->feeReserve;
 
@@ -333,20 +388,13 @@ if ($result['paid']) {
     echo "Payment successful!\n";
     echo "Preimage: " . $result['preimage'] . "\n";
 
-    // Handle change
+    // Change is automatically stored in database
     if (!empty($result['change'])) {
         $changeAmount = Wallet::sumProofs($result['change']);
-        echo "Change received: $changeAmount sat\n";
-
-        // Combine change with unused proofs
-        $usedSecrets = array_map(fn($p) => $p->secret, $selectedProofs);
-        $unusedProofs = array_filter($proofs, fn($p) => !in_array($p->secret, $usedSecrets));
-        $allProofs = array_merge(array_values($unusedProofs), $result['change']);
-
-        // Save updated proofs
-        $json = json_encode(array_map(fn($p) => $p->toArray(true), $allProofs));
-        file_put_contents('proofs.json', $json);
+        echo "Change received: " . $wallet->formatAmount($changeAmount) . "\n";
     }
+
+    echo "New balance: " . $wallet->formatAmount($wallet->getBalance()) . "\n";
 } else {
     echo "Payment failed or pending\n";
 }
@@ -359,7 +407,8 @@ Recover tokens using your seed phrase:
 ```php
 use Cashu\Wallet;
 
-$wallet = new Wallet('https://testnut.cashu.space');
+// Create wallet with storage (important for recovered counters!)
+$wallet = new Wallet('https://testnut.cashu.space', 'sat', '/path/to/wallet.db');
 $wallet->loadMint();
 
 // Initialize with your backup seed
@@ -382,9 +431,8 @@ $counters = $result['counters'];
 echo "Recovered " . count($proofs) . " proofs\n";
 echo "Total: " . Wallet::sumProofs($proofs) . " sat\n";
 
-// Save recovered proofs
-$json = json_encode(array_map(fn($p) => $p->toArray(true), $proofs));
-file_put_contents('recovered_proofs.json', $json);
+// Proofs and counters automatically stored in database
+echo "New balance: " . $wallet->formatAmount($wallet->getBalance()) . "\n";
 ```
 
 ## Error Handling
