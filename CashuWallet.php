@@ -2116,7 +2116,7 @@ class TokenSerializer
             }
 
             $tokenData['t'][] = [
-                'i' => base64_decode($keysetId),
+                'i' => hex2bin($keysetId),
                 'p' => $proofArray
             ];
         }
@@ -2194,7 +2194,7 @@ class TokenSerializer
 
         $proofs = [];
         foreach ($data['t'] ?? [] as $tokenPart) {
-            $keysetId = base64_encode($tokenPart['i']);
+            $keysetId = bin2hex($tokenPart['i']);
 
             foreach ($tokenPart['p'] ?? [] as $p) {
                 $dleq = null;
