@@ -19,6 +19,7 @@ use Cashu\CashuException;
 use Cashu\InsufficientBalanceException;
 use Cashu\TokenSerializer;
 use Cashu\Unit;
+use Cashu\LightningAddress;
 
 // ============================================================================
 // HELPER FUNCTIONS
@@ -30,8 +31,20 @@ use Cashu\Unit;
 function prompt(string $msg, string $default = ''): string
 {
     $defaultStr = $default !== '' ? " [$default]" : '';
-    echo "$msg$defaultStr: ";
-    $input = trim(fgets(STDIN) ?: '');
+    $fullPrompt = "$msg$defaultStr: ";
+
+    // Use readline if available (better paste handling)
+    if (function_exists('readline')) {
+        $input = readline($fullPrompt);
+        if ($input === false) {
+            $input = '';
+        }
+    } else {
+        echo $fullPrompt;
+        $input = fgets(STDIN) ?: '';
+    }
+
+    $input = trim($input);
     return $input !== '' ? $input : $default;
 }
 
@@ -243,24 +256,27 @@ class CashuWalletTester
                     $this->meltTokens();
                     break;
                 case '3':
-                    $this->checkBalance();
+                    $this->payLightningAddress();
                     break;
                 case '4':
-                    $this->showToken();
+                    $this->checkBalance();
                     break;
                 case '5':
-                    $this->receiveToken();
+                    $this->showToken();
                     break;
                 case '6':
-                    $this->checkProofState();
+                    $this->receiveToken();
                     break;
                 case '7':
-                    $this->manageSeedPhrase();
+                    $this->checkProofState();
                     break;
                 case '8':
-                    $this->restoreWallet();
+                    $this->manageSeedPhrase();
                     break;
                 case '9':
+                    $this->restoreWallet();
+                    break;
+                case '0':
                     echo "Goodbye!\n";
                     exit(0);
                 default:
@@ -280,14 +296,15 @@ class CashuWalletTester
         echo "Current balance: $formattedBalance\n";
         echo "\n";
         echo "[1] Mint tokens (Lightning -> Tokens)\n";
-        echo "[2] Melt tokens (Tokens -> Lightning)\n";
-        echo "[3] Check balance\n";
-        echo "[4] Send tokens (create Cashu token)\n";
-        echo "[5] Receive token\n";
-        echo "[6] Check proof state\n";
-        echo "[7] Show seed phrase\n";
-        echo "[8] Restore from seed phrase\n";
-        echo "[9] Exit\n";
+        echo "[2] Melt tokens (Tokens -> Lightning invoice)\n";
+        echo "[3] Pay Lightning Address (Tokens -> user@domain)\n";
+        echo "[4] Check balance\n";
+        echo "[5] Send tokens (create Cashu token)\n";
+        echo "[6] Receive token\n";
+        echo "[7] Check proof state\n";
+        echo "[8] Show seed phrase\n";
+        echo "[9] Restore from seed phrase\n";
+        echo "[0] Exit\n";
         echo "\n";
     }
 
@@ -434,6 +451,153 @@ class CashuWalletTester
         }
     }
 
+    private function payLightningAddress(): void
+    {
+        $balance = Wallet::sumProofs($this->proofs);
+
+        if ($balance === 0) {
+            error("No tokens to pay with. Mint some tokens first.");
+            return;
+        }
+
+        $formattedBalance = $this->wallet->formatAmount($balance);
+        echo "Current balance: $formattedBalance\n";
+        echo "\n";
+
+        $address = prompt('Enter Lightning address (e.g., user@getalby.com)');
+
+        if (empty($address)) {
+            error("Lightning address cannot be empty");
+            return;
+        }
+
+        // Validate address format
+        if (!LightningAddress::isValid($address)) {
+            error("Invalid Lightning address format. Expected: user@domain");
+            return;
+        }
+
+        echo "\nResolving Lightning address...\n";
+
+        try {
+            $metadata = LightningAddress::resolve($address);
+
+            if ($metadata === null) {
+                error("Could not resolve Lightning address. Check that it exists.");
+                return;
+            }
+
+            $minSats = (int)($metadata['minSendable'] / 1000);
+            $maxSats = (int)($metadata['maxSendable'] / 1000);
+            $commentAllowed = $metadata['commentAllowed'];
+
+            echo "  - Min: " . $this->wallet->formatAmount($minSats) . "\n";
+            echo "  - Max: " . $this->wallet->formatAmount($maxSats) . "\n";
+            if ($commentAllowed > 0) {
+                echo "  - Comment: up to $commentAllowed chars\n";
+            }
+            echo "\n";
+
+            // Get amount
+            $unitHelper = $this->wallet->getUnitHelper();
+            $example = $unitHelper->getExampleAmount();
+            $amountStr = prompt("Amount to pay (e.g., $example)", $example);
+
+            try {
+                $amount = $this->wallet->parseAmount($amountStr);
+            } catch (\InvalidArgumentException $e) {
+                error("Invalid amount format");
+                return;
+            }
+
+            if ($amount <= 0) {
+                error("Amount must be positive");
+                return;
+            }
+
+            // Check amount limits
+            if ($amount < $minSats) {
+                error("Amount too low. Minimum: " . $this->wallet->formatAmount($minSats));
+                return;
+            }
+            if ($amount > $maxSats) {
+                error("Amount too high. Maximum: " . $this->wallet->formatAmount($maxSats));
+                return;
+            }
+
+            // Get comment if allowed
+            $comment = null;
+            if ($commentAllowed > 0) {
+                $comment = prompt('Add comment (optional)', '');
+                if ($comment === '') {
+                    $comment = null;
+                }
+            }
+
+            // Get invoice and quote
+            echo "\nGetting invoice from Lightning address...\n";
+            $invoice = LightningAddress::getInvoice($address, $amount, $comment);
+
+            echo "Requesting melt quote...\n";
+            $quote = $this->wallet->requestMeltQuote($invoice);
+
+            $totalNeeded = $quote->amount + $quote->feeReserve;
+
+            echo "\n";
+            echo "  - Amount: " . $this->wallet->formatAmount($quote->amount) . "\n";
+            echo "  - Fee reserve: " . $this->wallet->formatAmount($quote->feeReserve) . "\n";
+            echo "  - Total needed: " . $this->wallet->formatAmount($totalNeeded) . "\n";
+            echo "\n";
+
+            if ($totalNeeded > $balance) {
+                $formattedNeeded = $this->wallet->formatAmount($totalNeeded);
+                error("Insufficient balance. Need $formattedNeeded, have $formattedBalance.");
+                return;
+            }
+
+            $proceed = prompt("Pay " . $this->wallet->formatAmount($amount) . " to $address?", 'Y');
+            if (strtoupper($proceed) !== 'Y' && strtoupper($proceed) !== 'YES') {
+                info("Cancelled");
+                return;
+            }
+
+            echo "\nPaying...\n";
+
+            // Select proofs for payment
+            $selectedProofs = Wallet::selectProofs($this->proofs, $totalNeeded);
+
+            $result = $this->wallet->melt($quote->quote, $selectedProofs);
+
+            if ($result['paid']) {
+                success("Payment sent to $address!");
+                if (!empty($result['preimage'])) {
+                    echo "  - Preimage: {$result['preimage']}\n";
+                }
+
+                // Remove used proofs
+                $usedSecrets = array_map(fn($p) => $p->secret, $selectedProofs);
+                $this->proofs = array_filter(
+                    $this->proofs,
+                    fn($p) => !in_array($p->secret, $usedSecrets)
+                );
+
+                // Add change proofs
+                if (!empty($result['change'])) {
+                    $changeAmount = Wallet::sumProofs($result['change']);
+                    echo "  - Change received: " . $this->wallet->formatAmount($changeAmount) . "\n";
+                    $this->proofs = array_merge($this->proofs, $result['change']);
+                }
+
+                echo "\nCurrent balance: " . $this->wallet->formatAmount(Wallet::sumProofs($this->proofs)) . "\n";
+            } else {
+                error("Payment failed or is pending");
+            }
+
+        } catch (CashuException $e) {
+            error("Payment failed: " . $e->getMessage());
+        }
+    }
+
     private function checkBalance(): void
     {
         $balance = Wallet::sumProofs($this->proofs);
@@ -549,14 +713,48 @@ class CashuWalletTester
 
     private function receiveToken(): void
     {
-        $tokenString = prompt('Paste token string');
+        echo "Enter token or file path (if paste doesn't work, save to file first):\n";
+
+        $input = prompt('Token or path');
+
+        if (empty($input)) {
+            error("Input cannot be empty");
+            return;
+        }
+
+        $tokenString = $input;
+
+        // Check if it looks like a file path
+        $looksLikePath = str_starts_with($input, '/') ||
+                         str_starts_with($input, './') ||
+                         str_starts_with($input, '~/') ||
+                         (strlen($input) < 100 && !str_starts_with($input, 'cashu'));
+
+        if ($looksLikePath && !str_starts_with($input, 'cashu')) {
+            $filePath = $input;
+            // Expand ~ to home directory
+            if (str_starts_with($filePath, '~/')) {
+                $filePath = ($_SERVER['HOME'] ?? getenv('HOME')) . substr($filePath, 1);
+            }
+            if (file_exists($filePath)) {
+                $tokenString = trim(file_get_contents($filePath));
+                if (empty($tokenString)) {
+                    error("File is empty");
+                    return;
+                }
+                info("Read " . strlen($tokenString) . " chars from: $filePath");
+            } elseif (!str_starts_with($input, 'cashu')) {
+                error("File not found: $filePath");
+                return;
+            }
+        }
 
         if (empty($tokenString)) {
             error("Token string cannot be empty");
             return;
         }
 
-        echo "\nProcessing token...\n";
+        echo "\nProcessing token (" . strlen($tokenString) . " chars)...\n";
 
         try {
             // Deserialize first to check

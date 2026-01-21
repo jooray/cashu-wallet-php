@@ -17,6 +17,7 @@ use Cashu\Keyset;
 use Cashu\Unit;
 use Cashu\BigInt;
 use Cashu\Mnemonic;
+use Cashu\LightningAddress;
 use Cashu\CashuException;
 use Cashu\CashuProtocolException;
 use Cashu\InsufficientBalanceException;
@@ -312,6 +313,53 @@ $result = $wallet->melt($quote->quote, $selectedProofs);
 if ($result['paid']) {
     echo "Preimage: " . $result['preimage'];
     // Handle $result['change'] proofs
+}
+```
+
+---
+
+#### payToLightningAddress()
+
+```php
+public function payToLightningAddress(
+    string $address,
+    int $amountSats,
+    ?string $comment = null
+): array
+```
+
+Pay to a Lightning address using stored proofs. Combines LNURL-pay resolution with melt operation.
+
+**Parameters:**
+- `$address`: Lightning address (user@domain)
+- `$amountSats`: Amount in satoshis to pay
+- `$comment`: Optional payment comment (if supported by receiver)
+
+**Returns:** `array{paid: bool, preimage: ?string, amount: int, fee: int, change: Proof[]}`
+
+**Throws:**
+- `CashuException` if storage is not configured
+- `CashuException` if Lightning address resolution fails
+- `CashuException` if Lightning payment fails
+- `InsufficientBalanceException` if not enough balance
+
+**Auto-sync behavior:**
+- Input proofs marked as SPENT in storage
+- Change proofs stored automatically
+- No manual state management required
+
+**Example:**
+```php
+// Requires storage
+$wallet = new Wallet('https://testnut.cashu.space', 'sat', '/path/to/wallet.db');
+$wallet->loadMint();
+$wallet->initFromMnemonic('your seed phrase');
+
+$result = $wallet->payToLightningAddress('user@getalby.com', 100, 'Thanks!');
+if ($result['paid']) {
+    echo "Paid " . $result['amount'] . " sats\n";
+    echo "Fee: " . $result['fee'] . " sats\n";
+    echo "Preimage: " . $result['preimage'] . "\n";
 }
 ```
 
@@ -1231,6 +1279,103 @@ public function getPdo(): \PDO
 ```
 
 Get the PDO instance for advanced operations.
+
+---
+
+## LightningAddress Class
+
+Static class for LNURL-pay (Lightning Address) resolution and invoice generation.
+
+### isValid()
+
+```php
+public static function isValid(string $address): bool
+```
+
+Validate a Lightning address format.
+
+**Parameters:**
+- `$address`: Lightning address to validate
+
+**Returns:** `true` if format is valid (user@domain).
+
+**Example:**
+```php
+if (LightningAddress::isValid('user@getalby.com')) {
+    echo "Valid Lightning address\n";
+}
+```
+
+---
+
+### resolve()
+
+```php
+public static function resolve(string $address): ?array
+```
+
+Resolve Lightning address to LNURL-pay metadata.
+
+**Parameters:**
+- `$address`: Lightning address (user@domain)
+
+**Returns:** Array with LNURL metadata or `null` if resolution fails:
+```php
+[
+    'callback' => string,      // URL to request invoice from
+    'minSendable' => int,      // Minimum amount in millisatoshis
+    'maxSendable' => int,      // Maximum amount in millisatoshis
+    'commentAllowed' => int,   // Max comment length (0 = no comments)
+    'metadata' => string,      // Service metadata
+    'tag' => string,           // LNURL tag (usually 'payRequest')
+]
+```
+
+**Example:**
+```php
+$metadata = LightningAddress::resolve('user@getalby.com');
+if ($metadata !== null) {
+    echo "Min: " . ($metadata['minSendable'] / 1000) . " sats\n";
+    echo "Max: " . ($metadata['maxSendable'] / 1000) . " sats\n";
+    echo "Comment: " . ($metadata['commentAllowed'] ?: 'Not allowed') . "\n";
+}
+```
+
+---
+
+### getInvoice()
+
+```php
+public static function getInvoice(
+    string $address,
+    int $amountSats,
+    ?string $comment = null
+): string
+```
+
+Get a BOLT11 invoice from a Lightning address.
+
+**Parameters:**
+- `$address`: Lightning address (user@domain)
+- `$amountSats`: Amount in satoshis
+- `$comment`: Optional payment comment (truncated to allowed length)
+
+**Returns:** BOLT11 invoice string.
+
+**Throws:**
+- `CashuException` if address resolution fails
+- `CashuException` if amount is outside min/max range
+- `CashuException` if invoice request fails
+
+**Example:**
+```php
+try {
+    $invoice = LightningAddress::getInvoice('user@getalby.com', 100, 'Thanks!');
+    echo "Invoice: $invoice\n";
+} catch (CashuException $e) {
+    echo "Error: " . $e->getMessage() . "\n";
+}
+```
 
 ---
 

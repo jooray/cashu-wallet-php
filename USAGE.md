@@ -400,6 +400,80 @@ if ($result['paid']) {
 }
 ```
 
+### Pay Lightning Address
+
+Pay directly to a Lightning address (LNURL-pay) using your stored proofs:
+
+```php
+use Cashu\Wallet;
+use Cashu\LightningAddress;
+use Cashu\InsufficientBalanceException;
+
+$address = 'user@getalby.com'; // Lightning address
+$amountSats = 100;
+
+// Create wallet with storage (REQUIRED for payToLightningAddress)
+$wallet = new Wallet('https://testnut.cashu.space', 'sat', '/path/to/wallet.db');
+$wallet->loadMint();
+$wallet->initFromMnemonic('your seed phrase here');
+
+// 1. Validate and resolve Lightning address
+if (!LightningAddress::isValid($address)) {
+    throw new CashuException("Invalid Lightning address");
+}
+
+$metadata = LightningAddress::resolve($address);
+echo "Min: " . ($metadata['minSendable'] / 1000) . " sats\n";
+echo "Max: " . ($metadata['maxSendable'] / 1000) . " sats\n";
+
+// 2. Pay to Lightning address (handles everything automatically)
+try {
+    $result = $wallet->payToLightningAddress($address, $amountSats);
+
+    echo "Paid: " . ($result['paid'] ? 'YES' : 'NO') . "\n";
+    echo "Amount: " . $result['amount'] . " sats\n";
+    echo "Fee: " . $result['fee'] . " sats\n";
+
+    if ($result['preimage']) {
+        echo "Preimage: " . $result['preimage'] . "\n";
+    }
+
+    // Proof state is automatically managed:
+    // - Input proofs marked SPENT
+    // - Change proofs stored
+    echo "New balance: " . $wallet->formatAmount($wallet->getBalance()) . "\n";
+
+} catch (InsufficientBalanceException $e) {
+    echo "Not enough balance: " . $e->getMessage() . "\n";
+}
+```
+
+**Using LightningAddress directly:**
+
+```php
+use Cashu\LightningAddress;
+
+// Validate format
+if (LightningAddress::isValid('user@domain.com')) {
+    echo "Valid format\n";
+}
+
+// Resolve to get payment parameters
+$metadata = LightningAddress::resolve('user@getalby.com');
+// Returns: [
+//   'callback' => 'https://...',
+//   'minSendable' => 1000,      // millisats
+//   'maxSendable' => 100000000, // millisats
+//   'commentAllowed' => 144,    // max comment chars
+//   'metadata' => '...',
+//   'tag' => 'payRequest'
+// ]
+
+// Get BOLT11 invoice directly
+$invoice = LightningAddress::getInvoice('user@getalby.com', 100, 'Payment comment');
+// Returns: 'lnbc...'
+```
+
 ### Restoring a Wallet
 
 Recover tokens using your seed phrase:
@@ -474,6 +548,7 @@ Complete working examples are available in the `examples/` directory:
 - `send_token.php` - Split and send tokens
 - `receive_token.php` - Receive and claim tokens
 - `melt_tokens.php` - Pay Lightning invoice with tokens
+- `pay_lightning_address.php` - Pay to Lightning address (LNURL-pay)
 
 Run examples from the command line:
 
@@ -489,6 +564,9 @@ php examples/receive_token.php cashuBo2F0gaJha...
 
 # Pay Lightning invoice
 php examples/melt_tokens.php lnbc100n1p... proofs.json
+
+# Pay to Lightning address
+php examples/pay_lightning_address.php user@getalby.com 21 https://testnut.cashu.space "seed phrase"
 ```
 
 ## Token Formats

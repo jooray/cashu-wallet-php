@@ -4429,4 +4429,219 @@ class Wallet
             throw new CashuException("Failed to send token: HTTP $httpCode");
         }
     }
+
+    /**
+     * Pay to a Lightning address using stored proofs
+     *
+     * Combines LNURL-pay resolution with melt operation. Automatically:
+     * - Resolves Lightning address to get invoice
+     * - Selects proofs from storage
+     * - Executes melt and persists proof states
+     *
+     * @param string $address Lightning address (user@domain)
+     * @param int $amountSats Amount in satoshis to pay
+     * @param string|null $comment Optional comment (if supported by receiver)
+     * @return array{paid: bool, preimage: ?string, amount: int, fee: int, change: Proof[]}
+     * @throws CashuException If payment fails
+     */
+    public function payToLightningAddress(string $address, int $amountSats, ?string $comment = null): array
+    {
+        if (!$this->storage) {
+            throw new CashuException('Storage is required for payToLightningAddress');
+        }
+
+        // Get invoice from Lightning address
+        $bolt11 = LightningAddress::getInvoice($address, $amountSats, $comment);
+
+        // Request melt quote
+        $meltQuote = $this->requestMeltQuote($bolt11);
+        $totalNeeded = $meltQuote->amount + $meltQuote->feeReserve;
+
+        // Get proofs from storage and select
+        $proofs = $this->getStoredProofs();
+        $balance = self::sumProofs($proofs);
+
+        if ($balance < $totalNeeded) {
+            throw new InsufficientBalanceException(
+                "Insufficient balance. Have: {$balance} sats, Need: {$totalNeeded} sats"
+            );
+        }
+
+        $selectedProofs = self::selectProofs($proofs, $totalNeeded);
+
+        // Execute melt - automatically persists proof states
+        $result = $this->melt($meltQuote->quote, $selectedProofs);
+
+        if (!$result['paid']) {
+            throw new CashuException('Lightning payment failed');
+        }
+
+        // Calculate actual fee paid
+        $changeAmount = self::sumProofs($result['change'] ?? []);
+        $actualFee = $meltQuote->feeReserve - $changeAmount;
+
+        return [
+            'paid' => true,
+            'preimage' => $result['preimage'],
+            'amount' => $meltQuote->amount,
+            'fee' => $actualFee,
+            'change' => $result['change'],
+        ];
+    }
+}
+
+// ============================================================================
+// LIGHTNING ADDRESS (LNURL-PAY)
+// ============================================================================
+
+/**
+ * Lightning Address (LNURL-pay) resolution and invoice generation
+ *
+ * Handles the LNURL-pay protocol for Lightning addresses (user@domain format).
+ * Resolves addresses to payment endpoints and requests invoices.
+ *
+ * @see https://github.com/lnurl/luds - LNURL specifications
+ */
+class LightningAddress
+{
+    /**
+     * Validate a Lightning address format
+     *
+     * Checks if the string matches the user@domain format expected for
+     * Lightning addresses.
+     *
+     * @param string $address Lightning address to validate
+     * @return bool True if format is valid
+     */
+    public static function isValid(string $address): bool
+    {
+        return (bool)preg_match('/^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$/', $address);
+    }
+
+    /**
+     * Resolve Lightning address to LNURL-pay metadata
+     *
+     * Fetches the LNURL-pay endpoint and returns payment parameters including
+     * min/max amounts, callback URL, and comment support.
+     *
+     * @param string $address Lightning address (user@domain)
+     * @return array|null LNURL metadata or null if resolution fails
+     *   - callback: string - URL to request invoice from
+     *   - minSendable: int - Minimum amount in millisatoshis
+     *   - maxSendable: int - Maximum amount in millisatoshis
+     *   - commentAllowed: int - Max comment length (0 = no comments)
+     *   - metadata: string - Service metadata
+     *   - tag: string - LNURL tag (usually 'payRequest')
+     */
+    public static function resolve(string $address): ?array
+    {
+        if (!self::isValid($address)) {
+            return null;
+        }
+
+        [$username, $domain] = explode('@', $address, 2);
+
+        // Construct LNURL-pay well-known URL
+        $url = "https://{$domain}/.well-known/lnurlp/{$username}";
+
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 10,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_HTTPHEADER => ['Accept: application/json'],
+        ]);
+
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+        if ($httpCode !== 200 || empty($response)) {
+            return null;
+        }
+
+        $data = json_decode($response, true);
+
+        // Validate LNURL-pay response
+        if (!isset($data['callback']) || !isset($data['minSendable']) || !isset($data['maxSendable'])) {
+            return null;
+        }
+
+        return [
+            'callback' => $data['callback'],
+            'minSendable' => (int)$data['minSendable'],
+            'maxSendable' => (int)$data['maxSendable'],
+            'metadata' => $data['metadata'] ?? '',
+            'commentAllowed' => (int)($data['commentAllowed'] ?? 0),
+            'tag' => $data['tag'] ?? 'payRequest',
+        ];
+    }
+
+    /**
+     * Get a BOLT11 invoice from a Lightning address
+     *
+     * Resolves the address and requests an invoice for the specified amount.
+     *
+     * @param string $address Lightning address (user@domain)
+     * @param int $amountSats Amount in satoshis
+     * @param string|null $comment Optional payment comment
+     * @return string BOLT11 invoice
+     * @throws CashuException If resolution or invoice request fails
+     */
+    public static function getInvoice(string $address, int $amountSats, ?string $comment = null): string
+    {
+        $metadata = self::resolve($address);
+        if ($metadata === null) {
+            throw new CashuException("Failed to resolve Lightning address: {$address}");
+        }
+
+        $amountMsats = $amountSats * 1000;
+
+        // Check amount limits
+        if ($amountMsats < $metadata['minSendable']) {
+            throw new CashuException(
+                "Amount too low. Minimum: " . ($metadata['minSendable'] / 1000) . " sats"
+            );
+        }
+        if ($amountMsats > $metadata['maxSendable']) {
+            throw new CashuException(
+                "Amount too high. Maximum: " . ($metadata['maxSendable'] / 1000) . " sats"
+            );
+        }
+
+        // Build callback URL
+        $callbackUrl = $metadata['callback'];
+        $separator = (strpos($callbackUrl, '?') !== false) ? '&' : '?';
+        $callbackUrl .= $separator . 'amount=' . $amountMsats;
+
+        // Add comment if allowed
+        if ($comment && $metadata['commentAllowed'] > 0) {
+            $comment = substr($comment, 0, $metadata['commentAllowed']);
+            $callbackUrl .= '&comment=' . urlencode($comment);
+        }
+
+        // Request invoice
+        $ch = curl_init($callbackUrl);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 15,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_HTTPHEADER => ['Accept: application/json'],
+        ]);
+
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+        if ($httpCode !== 200 || empty($response)) {
+            throw new CashuException("Failed to get invoice from Lightning address");
+        }
+
+        $data = json_decode($response, true);
+
+        if (!isset($data['pr'])) {
+            $error = $data['reason'] ?? $data['message'] ?? 'Unknown error';
+            throw new CashuException("Lightning address error: {$error}");
+        }
+
+        return $data['pr'];
+    }
 }
