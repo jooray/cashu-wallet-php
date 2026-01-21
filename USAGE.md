@@ -639,14 +639,16 @@ $proofs = $wallet->mint($quote->quote, 100);
 
 ### Multi-Wallet Support
 
-Different mints get separate storage within the same database:
+Different mints and units get separate storage within the same database:
 
 ```php
-// Each wallet gets its own namespace based on mint URL
+// Each wallet gets its own namespace based on mint URL and unit
 $wallet1 = new Wallet('https://mint1.example.com', 'sat', '/path/to/wallet.db');
 $wallet2 = new Wallet('https://mint2.example.com', 'sat', '/path/to/wallet.db');
+$wallet3 = new Wallet('https://mint1.example.com', 'usd', '/path/to/wallet.db');
 
-// Proofs are kept separate per mint
+// Proofs are kept separate per mint AND per unit
+// wallet1 and wallet3 use the same mint but have separate storage
 ```
 
 ### Checking Storage

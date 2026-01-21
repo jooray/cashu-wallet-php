@@ -2323,8 +2323,9 @@ class WalletStorage
      *
      * @param string $dbPath Path to SQLite database file
      * @param string $mintUrl Mint URL (used to create wallet ID for multi-wallet support)
+     * @param string $unit Currency unit (e.g., 'sat', 'eur') - different units have separate wallets
      */
-    public function __construct(string $dbPath, string $mintUrl)
+    public function __construct(string $dbPath, string $mintUrl, string $unit = 'sat')
     {
         // Ensure directory exists
         $dir = dirname($dbPath);
@@ -2336,7 +2337,7 @@ class WalletStorage
         $this->pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
         $this->pdo->exec('PRAGMA journal_mode = WAL');
         $this->pdo->exec('PRAGMA busy_timeout = 5000');
-        $this->walletId = substr(hash('sha256', $mintUrl), 0, 16);
+        $this->walletId = substr(hash('sha256', $mintUrl . ':' . $unit), 0, 16);
         $this->initSchema();
     }
 
@@ -2398,7 +2399,7 @@ class WalletStorage
     }
 
     /**
-     * Get the wallet ID (hash of mint URL)
+     * Get the wallet ID (hash of mint URL and unit)
      */
     public function getWalletId(): string
     {
@@ -2791,7 +2792,7 @@ class Wallet
 
         if ($dbPath !== null) {
             $this->dbPath = $dbPath;
-            $this->storage = new WalletStorage($dbPath, $this->mintUrl);
+            $this->storage = new WalletStorage($dbPath, $this->mintUrl, $this->unit);
         }
     }
 

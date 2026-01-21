@@ -1067,12 +1067,13 @@ SQLite-based storage for wallet persistence. Created automatically when a `dbPat
 ### Constructor
 
 ```php
-public function __construct(string $dbPath, string $mintUrl)
+public function __construct(string $dbPath, string $mintUrl, string $unit = 'sat')
 ```
 
 **Parameters:**
 - `$dbPath`: Path to SQLite database file
 - `$mintUrl`: Mint URL (used to derive wallet ID for multi-wallet support)
+- `$unit`: Currency unit (default: `'sat'`) - different units have separate wallets
 
 ---
 
@@ -1268,7 +1269,7 @@ Standard PDO transaction methods for atomic operations.
 public function getWalletId(): string
 ```
 
-Get the wallet ID (hash of mint URL).
+Get the wallet ID (hash of mint URL and unit).
 
 ---
 
