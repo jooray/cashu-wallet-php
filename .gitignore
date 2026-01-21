@@ -1,3 +1,5 @@
 test-wallet.db
+test-wallet.db-shm
+test-wallet.db-wal
 AUDIT.md
 .claude/
