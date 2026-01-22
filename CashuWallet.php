@@ -4200,20 +4200,26 @@ class Wallet
 
                 // Load keys for this keyset if not already loaded
                 if (!isset($this->keys[$keysetId])) {
-                    $keysResponse = $this->client->get('keys/' . $keysetId);
-                    foreach ($keysResponse['keysets'] ?? [] as $keysetData) {
-                        if ($keysetData['id'] === $keysetId) {
-                            $keys = [];
-                            foreach ($keysetData['keys'] ?? [] as $amount => $pubkey) {
-                                $amountStr = (string)$amount;
-                                $maxStr = (string)PHP_INT_MAX;
-                                if (strlen($amountStr) < strlen($maxStr) ||
-                                    (strlen($amountStr) === strlen($maxStr) && $amountStr <= $maxStr)) {
-                                    $keys[(int)$amount] = $pubkey;
+                    try {
+                        // URL-encode keyset ID in case it contains special characters like /
+                        $keysResponse = $this->client->get('keys/' . urlencode($keysetId));
+                        foreach ($keysResponse['keysets'] ?? [] as $keysetData) {
+                            if ($keysetData['id'] === $keysetId) {
+                                $keys = [];
+                                foreach ($keysetData['keys'] ?? [] as $amount => $pubkey) {
+                                    $amountStr = (string)$amount;
+                                    $maxStr = (string)PHP_INT_MAX;
+                                    if (strlen($amountStr) < strlen($maxStr) ||
+                                        (strlen($amountStr) === strlen($maxStr) && $amountStr <= $maxStr)) {
+                                        $keys[(int)$amount] = $pubkey;
+                                    }
                                 }
+                                $this->keys[$keysetId] = $keys;
                             }
-                            $this->keys[$keysetId] = $keys;
                         }
+                    } catch (CashuProtocolException $e) {
+                        // Skip this keyset - keys not available (old/deprecated keyset)
+                        continue;
                     }
                 }
 
@@ -4251,16 +4257,64 @@ class Wallet
 
             // Store results for this unit
             if (!empty($unitProofs)) {
+                // Check proof states at mint before storing (NUT-07)
+                // This ensures we don't store spent proofs as UNSPENT
+                $unspentProofs = $unitProofs;
+                $spentProofs = [];
+
+                try {
+                    // Build Y values for batch check
+                    $Ys = [];
+                    foreach ($unitProofs as $proof) {
+                        $Y = Crypto::hashToCurve($proof->secret);
+                        $Ys[] = bin2hex(Secp256k1::compressPoint($Y));
+                    }
+
+                    // Check states at mint
+                    $response = $this->client->post('checkstate', ['Ys' => $Ys]);
+
+                    // Separate into unspent and spent
+                    $unspentProofs = [];
+                    $spentProofs = [];
+                    foreach ($response['states'] ?? [] as $i => $state) {
+                        $mintState = $state['state'] ?? 'UNSPENT';
+                        if (isset($unitProofs[$i])) {
+                            if ($mintState === 'SPENT') {
+                                $spentProofs[] = $unitProofs[$i];
+                            } else {
+                                $unspentProofs[] = $unitProofs[$i];
+                            }
+                        }
+                    }
+                } catch (\Exception $e) {
+                    // If checkstate fails, store all as UNSPENT (will be synced later)
+                    // This maintains backwards compatibility
+                }
+
                 $byUnit[$unit] = [
-                    'proofs' => $unitProofs,
+                    'proofs' => $unitProofs,  // Return all found proofs
                     'counters' => $unitCounters,
+                    'unspent' => $unspentProofs,
+                    'spent' => $spentProofs,
                 ];
 
                 // Store proofs and counters for this unit
                 if ($this->dbPath !== null) {
                     // Create storage for this unit (may be different from wallet's primary unit)
                     $unitStorage = new WalletStorage($this->dbPath, $this->mintUrl, $unit);
-                    $unitStorage->storeProofs($unitProofs);
+
+                    // Store unspent proofs as UNSPENT
+                    if (!empty($unspentProofs)) {
+                        $unitStorage->storeProofs($unspentProofs);
+                    }
+
+                    // Store spent proofs as SPENT (for record-keeping)
+                    if (!empty($spentProofs)) {
+                        $unitStorage->storeProofs($spentProofs);
+                        $spentSecrets = array_map(fn($p) => $p->secret, $spentProofs);
+                        $unitStorage->updateProofsState($spentSecrets, 'SPENT');
+                    }
+
                     foreach ($unitCounters as $keysetId => $counterVal) {
                         $unitStorage->setCounter($keysetId, $counterVal);
                     }
