@@ -3913,10 +3913,15 @@ class Wallet
      */
     public function keysetIdToInt(string $keysetId): int
     {
-        // Keyset IDs are base64-encoded (NUT-02), decode to get raw bytes
-        $decoded = base64_decode($keysetId);
-        if ($decoded === false) {
-            throw new CashuException("Invalid keyset ID: $keysetId");
+        if (TokenSerializer::isHexKeysetId($keysetId)) {
+            // Modern hex format (version 1, 16 hex chars) - decode from hex
+            $decoded = hex2bin($keysetId);
+        } else {
+            // Deprecated base64 format - decode from base64
+            $decoded = base64_decode($keysetId);
+            if ($decoded === false) {
+                throw new CashuException("Invalid keyset ID: $keysetId");
+            }
         }
 
         // Convert bytes to hex, then to BigInt
