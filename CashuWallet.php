@@ -2132,6 +2132,15 @@ class TokenSerializer
     }
 
     /**
+     * Check if keyset ID is in modern hex format (16 hex chars)
+     * V4 tokens only support this format; deprecated base64 IDs need V3 format
+     */
+    public static function isHexKeysetId(string $id): bool
+    {
+        return strlen($id) === 16 && ctype_xdigit($id);
+    }
+
+    /**
      * Deserialize a token string
      */
     public static function deserialize(string $tokenString): Token
@@ -3522,6 +3531,17 @@ class Wallet
         ?string $memo = null,
         bool $includeDleq = false
     ): string {
+        // V4 tokens only support modern hex keyset IDs (16 hex chars)
+        // If any proof has a deprecated base64 keyset ID, fall back to V3
+        if ($format === 'v4') {
+            foreach ($proofs as $proof) {
+                if (!TokenSerializer::isHexKeysetId($proof->id)) {
+                    $format = 'v3';
+                    break;
+                }
+            }
+        }
+
         if ($format === 'v4') {
             return TokenSerializer::serializeV4($this->mintUrl, $proofs, $this->unit, $memo, $includeDleq);
         } else {
