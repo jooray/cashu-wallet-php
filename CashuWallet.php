@@ -4135,15 +4135,32 @@ class Wallet
     /**
      * Full wallet restore - scan all keysets
      *
+     * Restores proofs from the mint by scanning all keysets for secrets derived
+     * from this wallet's seed. By default, restores ALL units from the mint.
+     *
+     * WARNING: Setting $allUnits to false is dangerous and can cause PROOF REUSE.
+     * Melt operations (Lightning withdrawals) return fee reserve change in sats,
+     * regardless of the original token's unit. For example, melting EUR tokens
+     * returns leftover fees as sat proofs. If you only restore EUR, those sat
+     * proofs are missed, and their counter values may be reused when you later
+     * mint sats - generating duplicate secrets and losing funds.
+     *
+     * Always restore all units unless you are certain no cross-unit operations
+     * (like melt) have ever been performed with this seed.
+     *
      * @param int $batchSize Number of counters to check per batch
      * @param int $emptyBatches Stop after this many consecutive empty batches
-     * @param callable|null $progressCallback Called with (keysetId, counter, proofsFound)
-     * @return array ['proofs' => Proof[], 'counters' => array]
+     * @param callable|null $progressCallback Called with (keysetId, counter, proofsFound, unit)
+     * @param bool $allUnits Restore ALL units from the mint. Default true.
+     *                       WARNING: Setting to false risks proof reuse - see above.
+     * @return array ['proofs' => Proof[], 'counters' => array, 'byUnit' => array]
+     *               'byUnit' contains ['unit' => ['proofs' => [], 'counters' => []]]
      */
     public function restore(
         int $batchSize = 25,
         int $emptyBatches = 3,
-        ?callable $progressCallback = null
+        ?callable $progressCallback = null,
+        bool $allUnits = true
     ): array {
         if (!$this->hasSeed()) {
             throw new CashuException('Cannot restore: wallet not initialized with seed');
@@ -4151,20 +4168,41 @@ class Wallet
 
         $allProofs = [];
         $finalCounters = [];
+        $byUnit = [];
 
-        // Get all keysets for this unit (including inactive ones)
+        // Get all keysets from the mint
         $keysetsResponse = $this->client->get('keysets');
-        $keysetIds = [];
 
+        // Group keysets by unit
+        $keysetsByUnit = [];
         foreach ($keysetsResponse['keysets'] ?? [] as $ks) {
-            if (($ks['unit'] ?? 'sat') === $this->unit) {
-                $keysetIds[] = $ks['id'];
+            $unit = $ks['unit'] ?? 'sat';
+
+            // If not restoring all units, skip units that don't match
+            if (!$allUnits && $unit !== $this->unit) {
+                continue;
+            }
+
+            if (!isset($keysetsByUnit[$unit])) {
+                $keysetsByUnit[$unit] = [];
+            }
+            $keysetsByUnit[$unit][] = $ks;
+        }
+
+        // Process each unit
+        foreach ($keysetsByUnit as $unit => $keysets) {
+            $unitProofs = [];
+            $unitCounters = [];
+
+            // Load keys for each keyset in this unit
+            foreach ($keysets as $ks) {
+                $keysetId = $ks['id'];
 
                 // Load keys for this keyset if not already loaded
-                if (!isset($this->keys[$ks['id']])) {
-                    $keysResponse = $this->client->get('keys/' . $ks['id']);
+                if (!isset($this->keys[$keysetId])) {
+                    $keysResponse = $this->client->get('keys/' . $keysetId);
                     foreach ($keysResponse['keysets'] ?? [] as $keysetData) {
-                        if ($keysetData['id'] === $ks['id']) {
+                        if ($keysetData['id'] === $keysetId) {
                             $keys = [];
                             foreach ($keysetData['keys'] ?? [] as $amount => $pubkey) {
                                 $amountStr = (string)$amount;
@@ -4174,56 +4212,71 @@ class Wallet
                                     $keys[(int)$amount] = $pubkey;
                                 }
                             }
-                            $this->keys[$ks['id']] = $keys;
+                            $this->keys[$keysetId] = $keys;
                         }
+                    }
+                }
+
+                // Scan this keyset
+                $counter = 0;
+                $emptyCount = 0;
+                $keysetProofs = [];
+
+                while ($emptyCount < $emptyBatches) {
+                    $proofs = $this->restoreBatch($keysetId, $counter, $batchSize);
+
+                    if ($progressCallback) {
+                        $progressCallback($keysetId, $counter, count($proofs), $unit);
+                    }
+
+                    if (empty($proofs)) {
+                        $emptyCount++;
+                    } else {
+                        $emptyCount = 0;
+                        $keysetProofs = array_merge($keysetProofs, $proofs);
+                    }
+
+                    $counter += $batchSize;
+                }
+
+                if (!empty($keysetProofs)) {
+                    $unitProofs = array_merge($unitProofs, $keysetProofs);
+                    $allProofs = array_merge($allProofs, $keysetProofs);
+                    // Set counter to the last found + 1
+                    $maxCounter = $counter - ($emptyBatches * $batchSize);
+                    $unitCounters[$keysetId] = $maxCounter + count($keysetProofs);
+                    $finalCounters[$keysetId] = $unitCounters[$keysetId];
+                }
+            }
+
+            // Store results for this unit
+            if (!empty($unitProofs)) {
+                $byUnit[$unit] = [
+                    'proofs' => $unitProofs,
+                    'counters' => $unitCounters,
+                ];
+
+                // Store proofs and counters for this unit
+                if ($this->dbPath !== null) {
+                    // Create storage for this unit (may be different from wallet's primary unit)
+                    $unitStorage = new WalletStorage($this->dbPath, $this->mintUrl, $unit);
+                    $unitStorage->storeProofs($unitProofs);
+                    foreach ($unitCounters as $keysetId => $counterVal) {
+                        $unitStorage->setCounter($keysetId, $counterVal);
                     }
                 }
             }
         }
 
-        // Scan each keyset
-        foreach ($keysetIds as $keysetId) {
-            $counter = 0;
-            $emptyCount = 0;
-            $keysetProofs = [];
-
-            while ($emptyCount < $emptyBatches) {
-                $proofs = $this->restoreBatch($keysetId, $counter, $batchSize);
-
-                if ($progressCallback) {
-                    $progressCallback($keysetId, $counter, count($proofs));
-                }
-
-                if (empty($proofs)) {
-                    $emptyCount++;
-                } else {
-                    $emptyCount = 0;
-                    $keysetProofs = array_merge($keysetProofs, $proofs);
-                }
-
-                $counter += $batchSize;
-            }
-
-            if (!empty($keysetProofs)) {
-                $allProofs = array_merge($allProofs, $keysetProofs);
-                // Set counter to the last found + 1
-                $maxCounter = 0;
-                foreach ($keysetProofs as $proof) {
-                    // We can't easily get the counter from proof, so use batch end
-                    $maxCounter = $counter - ($emptyBatches * $batchSize);
-                }
-                $finalCounters[$keysetId] = $maxCounter + count($keysetProofs);
-            }
-        }
-
-        // Update internal counters
+        // Update internal counters for this wallet's unit
         foreach ($finalCounters as $keysetId => $counter) {
             $this->counters[$keysetId] = $counter;
         }
 
         return [
             'proofs' => $allProofs,
-            'counters' => $finalCounters
+            'counters' => $finalCounters,
+            'byUnit' => $byUnit,
         ];
     }
 

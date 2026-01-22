@@ -1003,35 +1003,56 @@ class CashuWalletTester
         echo "\n";
 
         try {
+            // Restore ALL units to prevent proof reuse from melt fee change
             $result = $this->wallet->restore(
                 batchSize: 25,
                 emptyBatches: 3,
-                progressCallback: function ($keysetId, $counter, $found) {
+                progressCallback: function ($keysetId, $counter, $found, $unit) {
                     $shortId = substr($keysetId, 0, 8) . '...';
                     $range = $counter . '-' . ($counter + 24);
                     if ($found > 0) {
-                        echo "  Keyset $shortId: counters $range - \033[32mfound $found proofs\033[0m\n";
+                        echo "  [$unit] Keyset $shortId: counters $range - \033[32mfound $found proofs\033[0m\n";
                     } else {
-                        printLine("  Keyset $shortId: counters $range - scanning...");
+                        printLine("  [$unit] Keyset $shortId: counters $range - scanning...");
                     }
-                }
+                },
+                allUnits: true  // Restore all units (default) - prevents proof reuse from melt change
             );
 
             echo "\r\033[K"; // Clear the last line
 
-            $proofs = $result['proofs'];
-            $totalAmount = Wallet::sumProofs($proofs);
-            $formattedTotal = $this->wallet->formatAmount($totalAmount);
-
-            if (empty($proofs)) {
+            // Show results by unit
+            $byUnit = $result['byUnit'] ?? [];
+            if (empty($byUnit)) {
                 info("No tokens found for this seed.");
             } else {
-                // Add restored proofs to our local balance
-                $this->proofs = array_merge($this->proofs, $proofs);
-
                 echo "\n";
-                success("Restored " . count($proofs) . " proofs ($formattedTotal)");
-                echo "\nCurrent balance: " . $this->wallet->formatAmount(Wallet::sumProofs($this->proofs)) . "\n";
+                success("Restore complete! Found tokens in " . count($byUnit) . " unit(s):");
+                echo "\n";
+
+                foreach ($byUnit as $unit => $unitData) {
+                    $unitProofs = $unitData['proofs'];
+                    $unitAmount = Wallet::sumProofs($unitProofs);
+                    $formatted = Wallet::formatAmountForUnit($unitAmount, $unit);
+                    echo "  $unit: " . count($unitProofs) . " proofs ($formatted)\n";
+                }
+
+                // Only add proofs for this wallet's unit to local balance
+                $walletUnit = $this->wallet->getUnit();
+                if (isset($byUnit[$walletUnit])) {
+                    $this->proofs = array_merge($this->proofs, $byUnit[$walletUnit]['proofs']);
+                    echo "\nAdded " . $walletUnit . " proofs to current wallet balance.\n";
+                }
+
+                echo "Current balance: " . $this->wallet->formatAmount(Wallet::sumProofs($this->proofs)) . "\n";
+
+                // Warn about other units if present
+                $otherUnits = array_keys(array_diff_key($byUnit, [$walletUnit => true]));
+                if (!empty($otherUnits)) {
+                    echo "\n\033[33mNote: Found tokens in other units (" . implode(', ', $otherUnits) . ").\n";
+                    echo "These are stored but not shown in this wallet's balance.\n";
+                    echo "Create a wallet with that unit to access them.\033[0m\n";
+                }
             }
 
         } catch (CashuException $e) {

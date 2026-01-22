@@ -588,24 +588,41 @@ Restore tokens for a counter range in one batch.
 public function restore(
     int $batchSize = 25,
     int $emptyBatches = 3,
-    ?callable $progressCallback = null
+    ?callable $progressCallback = null,
+    bool $allUnits = true
 ): array
 ```
 
-Full wallet restore - scan all keysets.
+Full wallet restore - scan all keysets across all units.
 
 **Parameters:**
 - `$batchSize`: Counters per batch (default: 25)
 - `$emptyBatches`: Stop after N consecutive empty batches (default: 3)
-- `$progressCallback`: Called with `(keysetId, counter, proofsFound)`
+- `$progressCallback`: Called with `(keysetId, counter, proofsFound, unit)`
+- `$allUnits`: Restore ALL units from the mint (default: true)
 
-**Returns:** `array{proofs: Proof[], counters: array}`
+**Returns:** `array{proofs: Proof[], counters: array, byUnit: array}`
+- `proofs`: All recovered proofs across all units
+- `counters`: All keyset counters
+- `byUnit`: Results grouped by unit: `['unit' => ['proofs' => Proof[], 'counters' => array]]`
+
+**⚠️ WARNING:** Setting `$allUnits` to `false` is dangerous and can cause **proof reuse**.
+Melt operations return fee reserve change in sats regardless of the original unit. If you
+only restore your primary unit, those sat proofs are missed, and their counter values may
+be reused when later minting sats - generating duplicate secrets and losing funds.
 
 **Example:**
 ```php
-$result = $wallet->restore(25, 3, function($ks, $ctr, $found) {
-    echo "Scanning $ks at $ctr: found $found\n";
+$result = $wallet->restore(25, 3, function($ks, $ctr, $found, $unit) {
+    echo "[$unit] Scanning $ks at $ctr: found $found\n";
 });
+
+// Results by unit
+foreach ($result['byUnit'] as $unit => $data) {
+    echo "$unit: " . count($data['proofs']) . " proofs\n";
+}
+
+// All proofs
 $allProofs = $result['proofs'];
 ```
 

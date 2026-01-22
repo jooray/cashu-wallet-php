@@ -488,25 +488,51 @@ $wallet->loadMint();
 // Initialize with your backup seed
 $wallet->initFromMnemonic('your twelve word seed phrase here');
 
-// Restore tokens
+// Restore tokens - by default restores ALL units from the mint
 echo "Scanning for tokens...\n";
 
 $result = $wallet->restore(
     batchSize: 25,      // Counters per batch
     emptyBatches: 3,    // Stop after N empty batches
-    progressCallback: function($keysetId, $counter, $found) {
-        echo "Keyset $keysetId, counter $counter: found $found proofs\n";
-    }
+    progressCallback: function($keysetId, $counter, $found, $unit) {
+        echo "[$unit] Keyset $keysetId, counter $counter: found $found proofs\n";
+    },
+    allUnits: true      // Default: restore ALL units (highly recommended!)
 );
 
-$proofs = $result['proofs'];
-$counters = $result['counters'];
+// Results grouped by unit
+$byUnit = $result['byUnit'];
+foreach ($byUnit as $unit => $unitData) {
+    $proofs = $unitData['proofs'];
+    $counters = $unitData['counters'];
+    echo "Unit $unit: " . count($proofs) . " proofs (" .
+         Wallet::formatAmountForUnit(Wallet::sumProofs($proofs), $unit) . ")\n";
+}
 
-echo "Recovered " . count($proofs) . " proofs\n";
-echo "Total: " . Wallet::sumProofs($proofs) . " sat\n";
+// Total across all units
+$allProofs = $result['proofs'];
+echo "Total recovered: " . count($allProofs) . " proofs\n";
 
-// Proofs and counters automatically stored in database
+// Proofs and counters automatically stored in database (per unit)
 echo "New balance: " . $wallet->formatAmount($wallet->getBalance()) . "\n";
+```
+
+**⚠️ WARNING: Always restore ALL units**
+
+By default, `restore()` scans ALL units from the mint, not just your wallet's primary unit.
+This is critical because melt operations (Lightning withdrawals) return fee reserve change
+in sats, regardless of the original token's unit.
+
+For example, if you melt EUR tokens to pay a Lightning invoice, any leftover fee reserve
+is returned as sat proofs. If you later restore only EUR, those sat proofs are missed,
+and their counter values may be reused - causing **proof reuse and loss of funds**.
+
+```php
+// DANGEROUS: Only restores EUR, misses sat proofs from melt change
+$result = $wallet->restore(allUnits: false);  // DO NOT DO THIS unless certain
+
+// SAFE: Restores all units including sat change from melt operations
+$result = $wallet->restore();  // allUnits: true is the default
 ```
 
 ## Error Handling
