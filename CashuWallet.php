@@ -2302,6 +2302,9 @@ class MintClient
 
         if ($httpCode >= 400) {
             $errorMsg = $decoded['detail'] ?? "HTTP error $httpCode";
+            if (is_array($errorMsg)) {
+                $errorMsg = json_encode($errorMsg);
+            }
             $errorCode = $decoded['code'] ?? null;
             throw new CashuProtocolException($errorMsg, $errorCode);
         }
