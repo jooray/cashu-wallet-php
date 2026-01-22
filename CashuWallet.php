@@ -2423,6 +2423,67 @@ class WalletStorage
         return $this->pdo;
     }
 
+    /**
+     * List all wallets in the database with their statistics
+     *
+     * Static method that can be called without creating a wallet instance.
+     * Useful for discovery and debugging when you don't know which mints are stored.
+     *
+     * @param string $dbPath Path to SQLite database file
+     * @return array Array of wallet info arrays, each containing:
+     *               - wallet_id: string (hash of mint URL + unit)
+     *               - total_proofs: int
+     *               - unspent: int (count)
+     *               - spent: int (count)
+     *               - pending: int (count)
+     *               - balance: int (sum of unspent amounts)
+     *               - keyset_ids: string[] (unique keyset IDs for this wallet)
+     */
+    public static function listWallets(string $dbPath): array
+    {
+        if (!file_exists($dbPath)) {
+            return [];
+        }
+
+        $pdo = new \PDO("sqlite:$dbPath");
+        $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
+
+        // Get wallet statistics
+        $stmt = $pdo->query("
+            SELECT
+                wallet_id,
+                COUNT(*) as total_proofs,
+                SUM(CASE WHEN state = 'UNSPENT' THEN 1 ELSE 0 END) as unspent,
+                SUM(CASE WHEN state = 'SPENT' THEN 1 ELSE 0 END) as spent,
+                SUM(CASE WHEN state = 'PENDING' THEN 1 ELSE 0 END) as pending,
+                SUM(CASE WHEN state = 'UNSPENT' THEN amount ELSE 0 END) as balance
+            FROM cashu_proofs
+            GROUP BY wallet_id
+            ORDER BY total_proofs DESC
+        ");
+
+        $wallets = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+
+        // Get keyset IDs for each wallet
+        $keysetStmt = $pdo->query("
+            SELECT wallet_id, keyset_id
+            FROM cashu_proofs
+            GROUP BY wallet_id, keyset_id
+        ");
+
+        $keysetsByWallet = [];
+        foreach ($keysetStmt->fetchAll(\PDO::FETCH_ASSOC) as $row) {
+            $keysetsByWallet[$row['wallet_id']][] = $row['keyset_id'];
+        }
+
+        // Merge keyset IDs into wallet data
+        foreach ($wallets as &$wallet) {
+            $wallet['keyset_ids'] = $keysetsByWallet[$wallet['wallet_id']] ?? [];
+        }
+
+        return $wallets;
+    }
+
     // ========================================================================
     // PROOF MANAGEMENT
     // ========================================================================

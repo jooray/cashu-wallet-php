@@ -575,6 +575,7 @@ Complete working examples are available in the `examples/` directory:
 - `receive_token.php` - Receive and claim tokens
 - `melt_tokens.php` - Pay Lightning invoice with tokens
 - `pay_lightning_address.php` - Pay to Lightning address (LNURL-pay)
+- `refresh_wallet.php` - Sync proof states and restore counters (maintenance tool)
 
 Run examples from the command line:
 
@@ -593,6 +594,15 @@ php examples/melt_tokens.php lnbc100n1p... proofs.json
 
 # Pay to Lightning address
 php examples/pay_lightning_address.php user@getalby.com 21 https://testnut.cashu.space "seed phrase"
+
+# Refresh wallet - sync proof states with mint
+php examples/refresh_wallet.php /path/to/wallet.db https://mint.example.com sat "seed phrase"
+
+# Refresh wallet with full restore (fixes "outputs already signed" errors)
+php examples/refresh_wallet.php /path/to/wallet.db https://mint.example.com sat "seed phrase" --restore
+
+# List all wallets in a database
+php examples/refresh_wallet.php /path/to/wallet.db --list
 ```
 
 ## Token Formats
@@ -693,6 +703,39 @@ if ($wallet->hasStorage()) {
     // Clean up expired pending operations
     $cleaned = $storage->cleanExpiredPendingOperations();
 }
+```
+
+### Wallet Discovery
+
+List all wallets in a database without knowing the mint URLs:
+
+```php
+use Cashu\WalletStorage;
+
+// List all wallets in database
+$wallets = WalletStorage::listWallets('/path/to/wallet.db');
+
+foreach ($wallets as $wallet) {
+    echo "Wallet: {$wallet['wallet_id']}\n";
+    echo "  Unspent: {$wallet['unspent']} proofs\n";
+    echo "  Spent: {$wallet['spent']} proofs\n";
+    echo "  Balance: {$wallet['balance']}\n";
+    echo "  Keysets: " . implode(', ', $wallet['keyset_ids']) . "\n";
+}
+```
+
+This is useful for debugging and maintenance when you need to inspect what's in a database without knowing which mints were used.
+
+### Syncing Proof States
+
+If proofs were spent externally (e.g., token was redeemed elsewhere), sync local state with the mint:
+
+```php
+// Sync checks all unspent proofs and marks spent ones
+$result = $wallet->syncProofStates();
+
+echo "Checked: {$result['checked']} proofs\n";
+echo "Updated: {$result['updated']} marked as spent\n";
 ```
 
 ### Crash Recovery

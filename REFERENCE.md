@@ -1094,6 +1094,41 @@ public function __construct(string $dbPath, string $mintUrl, string $unit = 'sat
 
 ---
 
+### Static Methods
+
+#### listWallets()
+
+```php
+public static function listWallets(string $dbPath): array
+```
+
+List all wallets in the database with their statistics. Static method that can be called without creating a wallet instance. Useful for discovery and debugging when you don't know which mints are stored.
+
+**Parameters:**
+- `$dbPath`: Path to SQLite database file
+
+**Returns:** Array of wallet info arrays, each containing:
+- `wallet_id`: string (hash of mint URL + unit)
+- `total_proofs`: int
+- `unspent`: int (count of unspent proofs)
+- `spent`: int (count of spent proofs)
+- `pending`: int (count of pending proofs)
+- `balance`: int (sum of unspent amounts)
+- `keyset_ids`: string[] (unique keyset IDs for this wallet)
+
+**Example:**
+```php
+$wallets = WalletStorage::listWallets('/path/to/wallet.db');
+foreach ($wallets as $wallet) {
+    echo "Wallet {$wallet['wallet_id']}: ";
+    echo "{$wallet['unspent']} unspent proofs, ";
+    echo "balance: {$wallet['balance']}\n";
+    echo "  Keysets: " . implode(', ', $wallet['keyset_ids']) . "\n";
+}
+```
+
+---
+
 ### Proof Management
 
 #### storeProofs()
