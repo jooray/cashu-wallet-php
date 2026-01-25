@@ -13,6 +13,7 @@ require_once __DIR__ . '/CashuWallet.php';
 
 use Cashu\Wallet;
 use Cashu\Proof;
+use Cashu\ProofState;
 use Cashu\BigInt;
 use Cashu\Mnemonic;
 use Cashu\CashuException;
@@ -837,17 +838,17 @@ class CashuWalletTester
                 $amount = isset($this->proofs[$i]) ? $this->proofs[$i]->amount : 0;
                 $formattedAmount = $this->wallet->formatAmount($amount);
 
-                $color = match (strtoupper($stateStr)) {
-                    'UNSPENT' => "\033[32m", // green
-                    'PENDING' => "\033[33m", // yellow
-                    'SPENT' => "\033[31m",   // red
+                $color = match ($stateStr) {
+                    ProofState::UNSPENT => "\033[32m", // green
+                    ProofState::PENDING => "\033[33m", // yellow
+                    ProofState::SPENT => "\033[31m",   // red
                     default => "\033[0m",
                 };
 
                 echo "  Proof " . ($i + 1) . " ($formattedAmount): {$color}$stateStr\033[0m\n";
 
                 // Track spent proofs
-                if (strtoupper($stateStr) === 'SPENT') {
+                if ($stateStr === ProofState::SPENT) {
                     $spentIndices[] = $i;
                     $spentAmount += $amount;
                 }

@@ -9,6 +9,7 @@ All classes are in the `Cashu` namespace:
 ```php
 use Cashu\Wallet;
 use Cashu\Proof;
+use Cashu\ProofState;
 use Cashu\Token;
 use Cashu\TokenSerializer;
 use Cashu\MintQuote;
@@ -495,13 +496,13 @@ Check the spent/pending state of proofs.
 **Parameters:**
 - `$proofs`: `Proof[]` to check
 
-**Returns:** Array of state objects with `'state'` key (`'UNSPENT'`, `'SPENT'`, `'PENDING'`).
+**Returns:** Array of state objects with `'state'` key (`ProofState::UNSPENT`, `ProofState::SPENT`, `ProofState::PENDING`).
 
 **Example:**
 ```php
 $states = $wallet->checkProofState($proofs);
 foreach ($states as $state) {
-    echo $state['state']; // UNSPENT, SPENT, or PENDING
+    echo $state['state']; // ProofState::UNSPENT, ProofState::SPENT, or ProofState::PENDING
 }
 ```
 
@@ -756,6 +757,42 @@ $proof = Proof::fromArray([
 ]);
 
 $array = $proof->toArray(true); // Include DLEQ
+```
+
+---
+
+### ProofState
+
+String constants for proof states. Use these instead of raw strings for type safety.
+
+```php
+class ProofState
+{
+    public const UNSPENT = 'UNSPENT';   // Proof is valid and spendable
+    public const PENDING = 'PENDING';   // Proof is locked in a pending operation
+    public const SPENT = 'SPENT';       // Proof has been spent
+}
+```
+
+**Usage:**
+
+```php
+use Cashu\ProofState;
+
+// Checking proof states
+$states = $wallet->checkProofState($proofs);
+foreach ($states as $state) {
+    if ($state['state'] === ProofState::SPENT) {
+        echo "Proof is spent\n";
+    }
+}
+
+// Querying storage
+$unspent = $storage->getProofs(ProofState::UNSPENT);
+$pending = $storage->getProofs(ProofState::PENDING);
+
+// Updating proof states
+$storage->updateProofsState($secrets, ProofState::SPENT);
 ```
 
 ---
@@ -1154,7 +1191,7 @@ public function getProofs(string $state = 'UNSPENT'): array
 Get proofs by state.
 
 **Parameters:**
-- `$state`: `'UNSPENT'`, `'PENDING'`, or `'SPENT'`
+- `$state`: `ProofState::UNSPENT`, `ProofState::PENDING`, or `ProofState::SPENT`
 
 **Returns:** Array of proof data arrays.
 
@@ -1194,7 +1231,7 @@ Update the state of proofs by their secrets.
 
 **Parameters:**
 - `$secrets`: Array of secret strings
-- `$state`: New state (`'UNSPENT'`, `'PENDING'`, `'SPENT'`)
+- `$state`: New state (`ProofState::UNSPENT`, `ProofState::PENDING`, `ProofState::SPENT`)
 
 ---
 

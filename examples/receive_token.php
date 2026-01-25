@@ -21,6 +21,7 @@ require_once __DIR__ . '/../CashuWallet.php';
 use Cashu\Wallet;
 use Cashu\TokenSerializer;
 use Cashu\CashuException;
+use Cashu\ProofState;
 
 // Get token from argument
 if ($argc < 2) {
@@ -92,7 +93,7 @@ try {
     $allUnspent = true;
     foreach ($states as $state) {
         $stateStr = $state['state'] ?? 'UNKNOWN';
-        if ($stateStr !== 'UNSPENT') {
+        if ($stateStr !== ProofState::UNSPENT) {
             echo "Warning: Proof state is $stateStr\n";
             $allUnspent = false;
         }

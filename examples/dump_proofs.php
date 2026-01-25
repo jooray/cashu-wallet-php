@@ -19,6 +19,7 @@ require_once __DIR__ . '/../CashuWallet.php';
 use Cashu\WalletStorage;
 use Cashu\TokenSerializer;
 use Cashu\Proof;
+use Cashu\ProofState;
 
 if (count($argv) < 4 || in_array($argv[1] ?? '', ['--help', '-h'])) {
     fprintf(STDERR, "Usage: php dump_proofs.php <db_path> <mint_url> <unit>\n");
@@ -42,7 +43,7 @@ if (!filter_var($mintUrl, FILTER_VALIDATE_URL)) {
 }
 
 $storage = new WalletStorage($dbPath, $mintUrl, $unit);
-$rows = $storage->getProofs('UNSPENT');
+$rows = $storage->getProofs(ProofState::UNSPENT);
 
 if (empty($rows)) {
     fprintf(STDERR, "No unspent proofs found for mint=%s unit=%s\n", $mintUrl, $unit);

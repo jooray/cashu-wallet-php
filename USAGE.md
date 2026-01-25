@@ -307,6 +307,7 @@ Receive a token string by swapping for fresh proofs:
 use Cashu\Wallet;
 use Cashu\TokenSerializer;
 use Cashu\CashuException;
+use Cashu\ProofState;
 
 $tokenString = 'cashuBo2F0gaJhaUgAJTn...'; // Token from sender
 
@@ -326,7 +327,7 @@ $wallet->initFromMnemonic('your seed phrase here');
 // Check if proofs are still valid (not already spent)
 $states = $wallet->checkProofState($token->proofs);
 foreach ($states as $state) {
-    if ($state['state'] !== 'UNSPENT') {
+    if ($state['state'] !== ProofState::UNSPENT) {
         echo "Warning: Some proofs may be spent!\n";
     }
 }
