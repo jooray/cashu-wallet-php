@@ -1612,6 +1612,16 @@ class MeltQuote
     }
 }
 
+/**
+ * Proof state constants
+ */
+class ProofState
+{
+    const UNSPENT = 'UNSPENT';
+    const PENDING = 'PENDING';
+    const SPENT = 'SPENT';
+}
+
 // ============================================================================
 // NUT-18 PAYMENT REQUEST
 // ============================================================================
@@ -2276,6 +2286,8 @@ class MintClient
             CURLOPT_URL => $url,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => $this->timeout,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
             CURLOPT_HTTPHEADER => [
                 'Content-Type: application/json',
                 'Accept: application/json'
@@ -2535,7 +2547,7 @@ class WalletStorage
      * @param string $state Proof state ('UNSPENT', 'PENDING', 'SPENT')
      * @return array Array of proof data arrays
      */
-    public function getProofs(string $state = 'UNSPENT'): array
+    public function getProofs(string $state = ProofState::UNSPENT): array
     {
         $stmt = $this->pdo->prepare("
             SELECT keyset_id, amount, secret, C, dleq, state, mint_quote_id, created_at
@@ -2562,7 +2574,7 @@ class WalletStorage
 
         $placeholders = implode(',', array_fill(0, count($secrets), '?'));
         $params = array_merge(
-            [$state, $state === 'SPENT' ? time() : null, $this->walletId],
+            [$state, $state === ProofState::SPENT ? time() : null, $this->walletId],
             $secrets
         );
 
@@ -2572,6 +2584,32 @@ class WalletStorage
             WHERE wallet_id = ? AND secret IN ($placeholders)
         ");
         $stmt->execute($params);
+    }
+
+    /**
+     * Get proof states by their secrets
+     *
+     * @param array $secrets Array of secret strings
+     * @return array Map of secret => state for matching proofs
+     */
+    public function getProofsStatesBySecrets(array $secrets): array
+    {
+        if (empty($secrets)) {
+            return [];
+        }
+
+        $placeholders = implode(',', array_fill(0, count($secrets), '?'));
+        $stmt = $this->pdo->prepare("
+            SELECT secret, state FROM cashu_proofs
+            WHERE wallet_id = ? AND secret IN ($placeholders)
+        ");
+        $stmt->execute(array_merge([$this->walletId], $secrets));
+
+        $result = [];
+        while ($row = $stmt->fetch(\PDO::FETCH_ASSOC)) {
+            $result[$row['secret']] = $row['state'];
+        }
+        return $result;
     }
 
     /**
@@ -2640,7 +2678,7 @@ class WalletStorage
      */
     public function incrementCounter(string $keysetId): int
     {
-        $this->pdo->beginTransaction();
+        $this->pdo->exec('BEGIN IMMEDIATE');
         try {
             $current = $this->getCounter($keysetId);
             $this->setCounter($keysetId, $current + 1);
@@ -2700,6 +2738,27 @@ class WalletStorage
             time(),
             $expiresAt
         ]);
+    }
+
+    /**
+     * Get a pending operation by its ID
+     *
+     * @param string $id Operation ID
+     * @return array|null Operation data or null if not found
+     */
+    public function getPendingOperationById(string $id): ?array
+    {
+        $stmt = $this->pdo->prepare("
+            SELECT id, type, data, created_at, expires_at
+            FROM cashu_pending_operations
+            WHERE id = ? AND wallet_id = ?
+        ");
+        $stmt->execute([$id, $this->walletId]);
+        $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+        if ($row) {
+            $row['data'] = json_decode($row['data'], true);
+        }
+        return $row ?: null;
     }
 
     /**
@@ -2984,7 +3043,7 @@ class Wallet
             throw new CashuException('No storage configured');
         }
 
-        $proofs = $this->storage->getProofs('UNSPENT');
+        $proofs = $this->storage->getProofs(ProofState::UNSPENT);
         return array_sum(array_map(fn($p) => (int)$p['amount'], $proofs));
     }
 
@@ -3000,7 +3059,7 @@ class Wallet
             throw new CashuException('No storage configured');
         }
 
-        $rows = $this->storage->getProofs('UNSPENT');
+        $rows = $this->storage->getProofs(ProofState::UNSPENT);
 
         return array_map(function($row) {
             $dleq = null;
@@ -3041,7 +3100,7 @@ class Wallet
             return ['error' => 'No storage configured', 'checked' => 0, 'updated' => 0, 'errors' => 0];
         }
 
-        $proofs = $this->storage->getProofs('UNSPENT');
+        $proofs = $this->storage->getProofs(ProofState::UNSPENT);
         if (empty($proofs)) {
             return ['checked' => 0, 'updated' => 0, 'errors' => 0];
         }
@@ -3060,14 +3119,14 @@ class Wallet
             $updated = 0;
             $toUpdate = [];
             foreach ($response['states'] ?? [] as $i => $state) {
-                $mintState = $state['state'] ?? 'UNSPENT';
-                if ($mintState === 'SPENT' && isset($proofs[$i])) {
+                $mintState = $state['state'] ?? ProofState::UNSPENT;
+                if ($mintState === ProofState::SPENT && isset($proofs[$i])) {
                     $toUpdate[] = $proofs[$i]['secret'];
                 }
             }
 
             if (!empty($toUpdate)) {
-                $this->storage->updateProofsState($toUpdate, 'SPENT');
+                $this->storage->updateProofsState($toUpdate, ProofState::SPENT);
                 $updated = count($toUpdate);
             }
 
@@ -3236,6 +3295,10 @@ class Wallet
      */
     public function requestMintQuote(int $amount): MintQuote
     {
+        if ($amount <= 0) {
+            throw new CashuException('Amount must be greater than 0');
+        }
+
         $response = $this->client->post('mint/quote/bolt11', [
             'amount' => $amount,
             'unit' => $this->unit
@@ -3257,11 +3320,6 @@ class Wallet
      * Mint tokens after quote is paid
      *
      * @return Proof[]
-     */
-    /**
-     * Mint tokens after quote is paid
-     *
-     * @return Proof[]
      * @throws CashuException if wallet is not in a safe state for minting
      */
     public function mint(string $quoteId, int $amount): array
@@ -3269,30 +3327,44 @@ class Wallet
         $keysetId = $this->getActiveKeysetId();
         $amounts = self::splitAmount($amount);
 
-        // Create blinded messages
-        $outputs = [];
-        $blindingData = [];
-
         $this->requireSeed();
         $this->requireSafeState();
 
-        foreach ($amounts as $amt) {
-            // Use deterministic secrets (NUT-13)
-            $counter = $this->nextCounter($keysetId);
-            $blinded = $this->createDeterministicBlindedMessage($keysetId, $counter);
-            $secret = $blinded['secret'];
+        // Check for pending operation (retry case)
+        $pendingId = "mint:$quoteId";
+        $pending = $this->storage ? $this->storage->getPendingOperationById($pendingId) : null;
 
-            $outputs[] = [
-                'amount' => $amt,
-                'id' => $keysetId,
-                'B_' => $blinded['B_']
-            ];
+        $outputs = [];
+        $blindingData = [];
 
-            $blindingData[] = [
-                'secret' => $secret,
-                'r' => $blinded['r'],
-                'amount' => $amt
-            ];
+        if ($pending) {
+            // RETRY: rebuild blinding data from stored counter range
+            $counterStart = $pending['data']['counter_start'];
+            $pendingKeysetId = $pending['data']['keyset_id'];
+            $amounts = $pending['data']['amounts'];
+            foreach ($amounts as $i => $amt) {
+                $blinded = $this->createDeterministicBlindedMessage($pendingKeysetId, $counterStart + $i);
+                $outputs[] = ['amount' => $amt, 'id' => $pendingKeysetId, 'B_' => $blinded['B_']];
+                $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
+            }
+            $keysetId = $pendingKeysetId;
+        } else {
+            // FIRST ATTEMPT: increment counters and record pending op
+            $counterStart = $this->getCounter($keysetId);
+            foreach ($amounts as $amt) {
+                $counter = $this->nextCounter($keysetId);
+                $blinded = $this->createDeterministicBlindedMessage($keysetId, $counter);
+                $outputs[] = ['amount' => $amt, 'id' => $keysetId, 'B_' => $blinded['B_']];
+                $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
+            }
+            // Record pending operation before network call
+            if ($this->storage) {
+                $this->storage->savePendingOperation($pendingId, 'mint', [
+                    'counter_start' => $counterStart,
+                    'keyset_id' => $keysetId,
+                    'amounts' => $amounts,
+                ]);
+            }
         }
 
         // Request signatures from mint
@@ -3303,9 +3375,7 @@ class Wallet
 
         // Unblind signatures to create proofs
         $proofs = [];
-        $signatures = $response['signatures'] ?? [];
-
-        foreach ($signatures as $i => $sig) {
+        foreach ($response['signatures'] ?? [] as $i => $sig) {
             $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
             $C = Crypto::unblindSignature($sig['C_'], $blindingData[$i]['r'], $pubkey);
 
@@ -3327,9 +3397,10 @@ class Wallet
             );
         }
 
-        // Auto-persist proofs to storage
+        // Store proofs and clean up pending operation
         if ($this->storage) {
             $this->storage->storeProofs($proofs, $quoteId);
+            $this->storage->deletePendingOperation($pendingId);
         }
 
         return $proofs;
@@ -3369,6 +3440,17 @@ class Wallet
      */
     public function melt(string $quoteId, array $proofs): array
     {
+        // Validate proof states before spending
+        if ($this->storage) {
+            $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
+            $states = $this->storage->getProofsStatesBySecrets($inputSecrets);
+            foreach ($states as $secret => $state) {
+                if ($state !== ProofState::UNSPENT) {
+                    throw new CashuException("Cannot spend proof: state is $state");
+                }
+            }
+        }
+
         $keysetId = $this->getActiveKeysetId();
         $proofsSum = self::sumProofs($proofs);
 
@@ -3379,6 +3461,10 @@ class Wallet
         // Calculate change amount
         $changeAmount = $proofsSum - $totalNeeded;
 
+        // Check for pending operation (retry case)
+        $pendingId = "melt:$quoteId";
+        $pending = $this->storage ? $this->storage->getPendingOperationById($pendingId) : null;
+
         // Create change outputs if needed
         $outputs = [];
         $blindingData = [];
@@ -3386,25 +3472,36 @@ class Wallet
         if ($changeAmount > 0) {
             $this->requireSeed();
             $this->requireSafeState();
-            $changeAmounts = self::splitAmount($changeAmount);
 
-            foreach ($changeAmounts as $amt) {
-                // Use deterministic secrets (NUT-13)
-                $counter = $this->nextCounter($keysetId);
-                $blinded = $this->createDeterministicBlindedMessage($keysetId, $counter);
-                $secret = $blinded['secret'];
-
-                $outputs[] = [
-                    'amount' => $amt,
-                    'id' => $keysetId,
-                    'B_' => $blinded['B_']
-                ];
-
-                $blindingData[] = [
-                    'secret' => $secret,
-                    'r' => $blinded['r'],
-                    'amount' => $amt
-                ];
+            if ($pending) {
+                // RETRY: rebuild blinding data from stored counter range
+                $counterStart = $pending['data']['counter_start'];
+                $pendingKeysetId = $pending['data']['keyset_id'];
+                $changeAmounts = $pending['data']['amounts'];
+                foreach ($changeAmounts as $i => $amt) {
+                    $blinded = $this->createDeterministicBlindedMessage($pendingKeysetId, $counterStart + $i);
+                    $outputs[] = ['amount' => $amt, 'id' => $pendingKeysetId, 'B_' => $blinded['B_']];
+                    $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
+                }
+                $keysetId = $pendingKeysetId;
+            } else {
+                // FIRST ATTEMPT: increment counters and record pending op
+                $changeAmounts = self::splitAmount($changeAmount);
+                $counterStart = $this->getCounter($keysetId);
+                foreach ($changeAmounts as $amt) {
+                    $counter = $this->nextCounter($keysetId);
+                    $blinded = $this->createDeterministicBlindedMessage($keysetId, $counter);
+                    $outputs[] = ['amount' => $amt, 'id' => $keysetId, 'B_' => $blinded['B_']];
+                    $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
+                }
+                // Record pending operation before network call
+                if ($this->storage) {
+                    $this->storage->savePendingOperation($pendingId, 'melt', [
+                        'counter_start' => $counterStart,
+                        'keyset_id' => $keysetId,
+                        'amounts' => $changeAmounts,
+                    ]);
+                }
             }
         }
 
@@ -3433,12 +3530,15 @@ class Wallet
         if ($this->storage) {
             // Mark input proofs as spent
             $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
-            $this->storage->updateProofsState($inputSecrets, 'SPENT');
+            $this->storage->updateProofsState($inputSecrets, ProofState::SPENT);
 
             // Store change proofs
             if (!empty($changeProofs)) {
                 $this->storage->storeProofs($changeProofs);
             }
+
+            // Clean up pending operation
+            $this->storage->deletePendingOperation($pendingId);
         }
 
         return [
@@ -3473,6 +3573,18 @@ class Wallet
         // Create blinded messages
         $this->requireSeed();
         $this->requireSafeState();
+
+        // Validate proof states before spending
+        if ($this->storage) {
+            $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
+            $states = $this->storage->getProofsStatesBySecrets($inputSecrets);
+            foreach ($states as $secret => $state) {
+                if ($state !== ProofState::UNSPENT) {
+                    throw new CashuException("Cannot spend proof: state is $state");
+                }
+            }
+        }
+
         $outputs = [];
         $blindingData = [];
 
@@ -3519,7 +3631,7 @@ class Wallet
         if ($this->storage) {
             // Mark input proofs as spent
             $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
-            $this->storage->updateProofsState($inputSecrets, 'SPENT');
+            $this->storage->updateProofsState($inputSecrets, ProofState::SPENT);
 
             // Store new proofs
             $this->storage->storeProofs($newProofs);
@@ -3777,6 +3889,11 @@ class Wallet
 
     /**
      * Initialize wallet from a mnemonic phrase
+     *
+     * IMPORTANT: If the database has been lost or corrupted, call restore() after
+     * initFromMnemonic() before performing any mint/swap/melt operations. A fresh
+     * database will have counters at 0, which can cause secret reuse if the wallet
+     * was previously used with higher counter values.
      */
     public function initFromMnemonic(string $mnemonic, string $passphrase = ''): void
     {
@@ -3905,6 +4022,30 @@ class Wallet
     public function getMnemonic(): ?string
     {
         return $this->mnemonic;
+    }
+
+    /**
+     * Redact sensitive fields from var_dump/print_r output
+     */
+    public function __debugInfo(): array
+    {
+        return [
+            'mintUrl' => $this->mintUrl,
+            'unit' => $this->unit,
+            'hasSeed' => $this->hasSeed(),
+            'mnemonic' => $this->mnemonic ? '[REDACTED]' : null,
+            'bip32' => $this->bip32 ? '[REDACTED]' : null,
+            'counters' => $this->counters,
+            'activeKeysetId' => $this->activeKeysetId ?? null,
+        ];
+    }
+
+    /**
+     * Prevent serialization of wallet objects containing secret key material
+     */
+    public function __serialize(): array
+    {
+        throw new CashuException('Wallet objects must not be serialized - they contain secret key material');
     }
 
     /**
@@ -4366,9 +4507,9 @@ class Wallet
                     $unspentProofs = [];
                     $spentProofs = [];
                     foreach ($response['states'] ?? [] as $i => $state) {
-                        $mintState = $state['state'] ?? 'UNSPENT';
+                        $mintState = $state['state'] ?? ProofState::UNSPENT;
                         if (isset($unitProofs[$i])) {
-                            if ($mintState === 'SPENT') {
+                            if ($mintState === ProofState::SPENT) {
                                 $spentProofs[] = $unitProofs[$i];
                             } else {
                                 $unspentProofs[] = $unitProofs[$i];
@@ -4401,7 +4542,7 @@ class Wallet
                     if (!empty($spentProofs)) {
                         $unitStorage->storeProofs($spentProofs);
                         $spentSecrets = array_map(fn($p) => $p->secret, $spentProofs);
-                        $unitStorage->updateProofsState($spentSecrets, 'SPENT');
+                        $unitStorage->updateProofsState($spentSecrets, ProofState::SPENT);
                     }
 
                     foreach ($unitCounters as $keysetId => $counterVal) {
@@ -4585,7 +4726,7 @@ class Wallet
         // Mark proofs as spent in storage
         if ($this->hasStorage()) {
             $secrets = array_map(fn($p) => $p->secret, $sendProofs);
-            $this->storage->updateProofsState($secrets, 'SPENT');
+            $this->storage->updateProofsState($secrets, ProofState::SPENT);
 
             // Store keep proofs
             if (!empty($split['keep'])) {
