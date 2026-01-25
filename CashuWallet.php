@@ -3127,7 +3127,8 @@ class Wallet
             $updated = 0;
             $toUpdate = [];
             foreach ($response['states'] ?? [] as $i => $state) {
-                $mintState = $state['state'] ?? ProofState::UNSPENT;
+                // Normalize case - mints may return lowercase states
+                $mintState = strtoupper($state['state'] ?? ProofState::UNSPENT);
                 if ($mintState === ProofState::SPENT && isset($proofs[$i])) {
                     $toUpdate[] = $proofs[$i]['secret'];
                 }
@@ -3550,7 +3551,8 @@ class Wallet
         }
 
         return [
-            'paid' => ($response['state'] ?? '') === 'PAID',
+            // Normalize case - mints may return lowercase states
+            'paid' => strtoupper($response['state'] ?? '') === 'PAID',
             'preimage' => $response['payment_preimage'] ?? null,
             'change' => $changeProofs
         ];
@@ -4515,7 +4517,8 @@ class Wallet
                     $unspentProofs = [];
                     $spentProofs = [];
                     foreach ($response['states'] ?? [] as $i => $state) {
-                        $mintState = $state['state'] ?? ProofState::UNSPENT;
+                        // Normalize case - mints may return lowercase states
+                        $mintState = strtoupper($state['state'] ?? ProofState::UNSPENT);
                         if (isset($unitProofs[$i])) {
                             if ($mintState === ProofState::SPENT) {
                                 $spentProofs[] = $unitProofs[$i];
