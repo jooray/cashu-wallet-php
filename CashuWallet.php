@@ -2678,14 +2678,22 @@ class WalletStorage
      */
     public function incrementCounter(string $keysetId): int
     {
+        // Use BEGIN IMMEDIATE to acquire lock immediately and prevent race conditions
+        // when multiple processes try to increment the counter concurrently.
+        // We use raw SQL commands throughout since exec('BEGIN IMMEDIATE') doesn't
+        // update PDO's internal transaction state.
         $this->pdo->exec('BEGIN IMMEDIATE');
         try {
             $current = $this->getCounter($keysetId);
             $this->setCounter($keysetId, $current + 1);
-            $this->pdo->commit();
+            $this->pdo->exec('COMMIT');
             return $current;
         } catch (\Exception $e) {
-            $this->pdo->rollBack();
+            try {
+                $this->pdo->exec('ROLLBACK');
+            } catch (\Exception $rollbackEx) {
+                // Transaction may have already been rolled back or not started
+            }
             throw $e;
         }
     }
