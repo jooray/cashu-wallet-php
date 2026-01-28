@@ -3219,6 +3219,170 @@ class Wallet
     }
 
     /**
+     * Recover pending melt operations
+     *
+     * Checks all pending melt operations against the mint and updates
+     * proof states accordingly:
+     * - PAID: Mark input proofs as SPENT, recover change proofs, delete pending op
+     * - UNPAID + expired: Mark input proofs as UNSPENT, delete pending op
+     * - PENDING or UNPAID + not expired: Keep as-is for next check
+     *
+     * @return array{
+     *   checked: int,
+     *   paid: int,
+     *   restored: int,
+     *   still_pending: int,
+     *   change_recovered: int,
+     *   errors: array<string, string>
+     * }
+     */
+    public function recoverPendingMelts(): array
+    {
+        $result = [
+            'checked' => 0,
+            'paid' => 0,
+            'restored' => 0,
+            'still_pending' => 0,
+            'change_recovered' => 0,
+            'errors' => [],
+        ];
+
+        // Early return if no storage
+        if (!$this->storage) {
+            return $result;
+        }
+
+        // Get pending melt operations
+        $pendingOps = $this->storage->getPendingOperations('melt');
+        if (empty($pendingOps)) {
+            return $result;
+        }
+
+        foreach ($pendingOps as $op) {
+            $result['checked']++;
+            $pendingId = $op['id'];
+
+            // Extract quoteId from operation ID (format: "melt:<quoteId>")
+            if (!str_starts_with($pendingId, 'melt:')) {
+                $result['errors'][$pendingId] = 'Invalid pending operation ID format';
+                continue;
+            }
+            $quoteId = substr($pendingId, 5);
+
+            try {
+                // Check quote status with mint
+                $quote = $this->checkMeltQuote($quoteId);
+                $state = strtoupper($quote->state);
+
+                if ($state === 'PAID') {
+                    // Payment successful - mark proofs as spent
+                    $inputSecrets = $op['data']['input_secrets'] ?? [];
+                    if (!empty($inputSecrets)) {
+                        $this->storage->updateProofsState($inputSecrets, ProofState::SPENT);
+                    }
+
+                    // Recover change proofs if available
+                    $changeAmount = $this->recoverMeltChange($op['data'], $quote);
+                    $result['change_recovered'] += $changeAmount;
+
+                    // Clean up pending operation
+                    $this->storage->deletePendingOperation($pendingId);
+                    $result['paid']++;
+
+                } elseif ($state === 'PENDING') {
+                    // Still in progress - keep for next check
+                    $result['still_pending']++;
+
+                } elseif ($state === 'UNPAID') {
+                    // Check if quote has expired
+                    $now = time();
+                    $expired = $quote->expiry !== null && $quote->expiry < $now;
+
+                    if ($expired) {
+                        // Quote expired - restore proofs to UNSPENT
+                        $inputSecrets = $op['data']['input_secrets'] ?? [];
+                        if (!empty($inputSecrets)) {
+                            $this->storage->updateProofsState($inputSecrets, ProofState::UNSPENT);
+                        }
+                        $this->storage->deletePendingOperation($pendingId);
+                        $result['restored']++;
+                    } else {
+                        // Not expired yet - user might still complete payment
+                        $result['still_pending']++;
+                    }
+                } else {
+                    // Unknown state - keep for next check
+                    $result['still_pending']++;
+                }
+            } catch (\Exception $e) {
+                $result['errors'][$quoteId] = $e->getMessage();
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Recover change proofs from a completed melt operation
+     *
+     * @param array $pendingData Pending operation data with counter_start, keyset_id, amounts
+     * @param MeltQuote $quote Quote response containing change signatures
+     * @return int Total amount of recovered change (in unit)
+     */
+    private function recoverMeltChange(array $pendingData, MeltQuote $quote): int
+    {
+        // No change signatures in quote response
+        if (empty($quote->change)) {
+            return 0;
+        }
+
+        $counterStart = $pendingData['counter_start'] ?? null;
+        $keysetId = $pendingData['keyset_id'] ?? null;
+        $amounts = $pendingData['amounts'] ?? [];
+
+        // Need counter data to regenerate blinding factors
+        if ($counterStart === null || $keysetId === null || empty($amounts)) {
+            return 0;
+        }
+
+        // Rebuild blinding data from stored counter range
+        $blindingData = [];
+        foreach ($amounts as $i => $amt) {
+            $blinded = $this->createDeterministicBlindedMessage($keysetId, $counterStart + $i);
+            $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
+        }
+
+        // Unblind change signatures and store proofs
+        $changeProofs = [];
+        $totalAmount = 0;
+
+        foreach ($quote->change as $i => $sig) {
+            if (!isset($blindingData[$i])) {
+                continue;
+            }
+
+            $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
+            $C = Crypto::unblindSignature($sig['C_'], $blindingData[$i]['r'], $pubkey);
+
+            $proof = new Proof(
+                $sig['id'],
+                $sig['amount'],
+                $blindingData[$i]['secret'],
+                $C
+            );
+
+            $changeProofs[] = $proof;
+            $totalAmount += $sig['amount'];
+        }
+
+        if (!empty($changeProofs)) {
+            $this->storage->storeProofs($changeProofs);
+        }
+
+        return $totalAmount;
+    }
+
+    /**
      * Parse a display amount string to smallest unit
      *
      * @param string $input User input (e.g., "0.05" for 5 cents in EUR)
@@ -3569,10 +3733,12 @@ class Wallet
                 }
                 // Record pending operation before network call
                 if ($this->storage) {
+                    $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
                     $this->storage->savePendingOperation($pendingId, 'melt', [
                         'counter_start' => $counterStart,
                         'keyset_id' => $keysetId,
                         'amounts' => $changeAmounts,
+                        'input_secrets' => $inputSecrets,
                     ]);
                 }
             }
@@ -3620,6 +3786,15 @@ class Wallet
             } elseif ($isPending) {
                 // Payment in progress - mark proofs as pending, keep pending op for recovery
                 $this->storage->updateProofsState($inputSecrets, ProofState::PENDING);
+                // Ensure pending operation exists for recovery (covers no-change case)
+                if (!$pending) {
+                    $this->storage->savePendingOperation($pendingId, 'melt', [
+                        'counter_start' => $counterStart ?? 0,
+                        'keyset_id' => $keysetId,
+                        'amounts' => $changeAmounts ?? [],
+                        'input_secrets' => $inputSecrets,
+                    ]);
+                }
                 // Don't store change yet - payment hasn't completed
                 // Don't delete pending operation - needed for recovery/retry
                 $changeProofs = []; // Clear change - not valid until payment completes

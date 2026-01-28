@@ -326,6 +326,46 @@ if ($result['paid']) {
 
 ---
 
+#### recoverPendingMelts()
+
+```php
+public function recoverPendingMelts(): array
+```
+
+Recover pending melt operations by checking quote status with the mint.
+
+When `melt()` returns `pending: true`, the input proofs are marked PENDING. If the payment later completes or fails, this function will update the proof states accordingly and recover any change.
+
+**Returns:** `array{checked: int, paid: int, restored: int, still_pending: int, change_recovered: int, errors: array}`
+
+| Field | Description |
+|-------|-------------|
+| `checked` | Number of pending operations checked |
+| `paid` | Melts confirmed as PAID (proofs marked SPENT) |
+| `restored` | Melts that failed/expired (proofs restored to UNSPENT) |
+| `still_pending` | Melts still in progress |
+| `change_recovered` | Amount of recovered change (in unit) |
+| `errors` | Map of quoteId => error message |
+
+**Behavior by quote state:**
+- **PAID**: Mark input proofs as SPENT, recover change proofs, delete pending op
+- **UNPAID + expired**: Mark input proofs as UNSPENT (restoring funds), delete pending op
+- **PENDING or UNPAID + not expired**: Keep as-is for next check
+
+**Example:**
+```php
+// Call on startup or periodically to recover stuck funds
+$result = $wallet->recoverPendingMelts();
+if ($result['checked'] > 0) {
+    echo "Recovered {$result['paid']} paid, {$result['restored']} failed\n";
+    if ($result['change_recovered'] > 0) {
+        echo "Change recovered: {$result['change_recovered']}\n";
+    }
+}
+```
+
+---
+
 #### payToLightningAddress()
 
 ```php
