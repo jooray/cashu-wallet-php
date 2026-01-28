@@ -3535,24 +3535,38 @@ class Wallet
             );
         }
 
+        // Check payment state - mints may return lowercase
+        $paymentState = strtoupper($response['state'] ?? '');
+        $isPaid = $paymentState === 'PAID';
+        $isPending = $paymentState === 'PENDING';
+
         // Auto-persist proof states to storage
         if ($this->storage) {
-            // Mark input proofs as spent
             $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
-            $this->storage->updateProofsState($inputSecrets, ProofState::SPENT);
 
-            // Store change proofs
-            if (!empty($changeProofs)) {
-                $this->storage->storeProofs($changeProofs);
+            if ($isPaid) {
+                // Payment successful - mark proofs as spent, store change, clean up
+                $this->storage->updateProofsState($inputSecrets, ProofState::SPENT);
+
+                if (!empty($changeProofs)) {
+                    $this->storage->storeProofs($changeProofs);
+                }
+
+                $this->storage->deletePendingOperation($pendingId);
+            } elseif ($isPending) {
+                // Payment in progress - mark proofs as pending, keep pending op for recovery
+                $this->storage->updateProofsState($inputSecrets, ProofState::PENDING);
+                // Don't store change yet - payment hasn't completed
+                // Don't delete pending operation - needed for recovery/retry
+                $changeProofs = []; // Clear change - not valid until payment completes
             }
-
-            // Clean up pending operation
-            $this->storage->deletePendingOperation($pendingId);
+            // If neither PAID nor PENDING (e.g., UNPAID/failed), leave proofs as UNSPENT
+            // and don't delete pending operation
         }
 
         return [
-            // Normalize case - mints may return lowercase states
-            'paid' => strtoupper($response['state'] ?? '') === 'PAID',
+            'paid' => $isPaid,
+            'pending' => $isPending,
             'preimage' => $response['payment_preimage'] ?? null,
             'change' => $changeProofs
         ];
