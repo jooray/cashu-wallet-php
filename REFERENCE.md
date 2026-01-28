@@ -306,7 +306,12 @@ Melt tokens to pay a Lightning invoice.
 - `$quoteId`: Quote ID from `requestMeltQuote()`
 - `$proofs`: `Proof[]` to spend (must cover amount + fee reserve)
 
-**Returns:** `array{paid: bool, preimage: ?string, change: Proof[]}`
+**Returns:** `array{paid: bool, pending: bool, preimage: ?string, change: Proof[]}`
+
+**Proof State Behavior:**
+- `paid=true`: Proofs marked SPENT, change stored
+- `pending=true`: Proofs marked PENDING (check quote status later)
+- Both false: Payment failed, proofs remain UNSPENT
 
 **Example:**
 ```php
@@ -314,6 +319,8 @@ $result = $wallet->melt($quote->quote, $selectedProofs);
 if ($result['paid']) {
     echo "Preimage: " . $result['preimage'];
     // Handle $result['change'] proofs
+} elseif ($result['pending']) {
+    echo "Payment pending - check quote status later";
 }
 ```
 

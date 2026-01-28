@@ -390,14 +390,20 @@ if ($result['paid']) {
     echo "Preimage: " . $result['preimage'] . "\n";
 
     // Change is automatically stored in database
+    // Proofs are marked SPENT only when paid=true
     if (!empty($result['change'])) {
         $changeAmount = Wallet::sumProofs($result['change']);
         echo "Change received: " . $wallet->formatAmount($changeAmount) . "\n";
     }
 
     echo "New balance: " . $wallet->formatAmount($wallet->getBalance()) . "\n";
+} elseif ($result['pending']) {
+    // Payment is pending - proofs marked PENDING in storage
+    // Check melt quote status later to confirm payment
+    echo "Payment pending - check quote status\n";
 } else {
-    echo "Payment failed or pending\n";
+    // Payment failed - proofs remain UNSPENT
+    echo "Payment failed\n";
 }
 ```
 
@@ -435,14 +441,21 @@ try {
     echo "Amount: " . $result['amount'] . " sats\n";
     echo "Fee: " . $result['fee'] . " sats\n";
 
-    if ($result['preimage']) {
-        echo "Preimage: " . $result['preimage'] . "\n";
+    if ($result['paid']) {
+        if ($result['preimage']) {
+            echo "Preimage: " . $result['preimage'] . "\n";
+        }
+        // Proof state is automatically managed:
+        // - Input proofs marked SPENT
+        // - Change proofs stored
+        echo "New balance: " . $wallet->formatAmount($wallet->getBalance()) . "\n";
+    } elseif ($result['pending'] ?? false) {
+        // Payment pending - proofs marked PENDING
+        echo "Payment pending - check status later\n";
+    } else {
+        // Payment failed - proofs remain UNSPENT
+        echo "Payment failed\n";
     }
-
-    // Proof state is automatically managed:
-    // - Input proofs marked SPENT
-    // - Change proofs stored
-    echo "New balance: " . $wallet->formatAmount($wallet->getBalance()) . "\n";
 
 } catch (InsufficientBalanceException $e) {
     echo "Not enough balance: " . $e->getMessage() . "\n";

@@ -136,6 +136,7 @@ try {
 
     echo "\n=== PAYMENT RESULT ===\n";
     echo "Paid: " . ($result['paid'] ? 'YES' : 'NO') . "\n";
+    echo "Pending: " . (($result['pending'] ?? false) ? 'YES' : 'NO') . "\n";
 
     if ($result['preimage']) {
         echo "Preimage: " . $result['preimage'] . "\n";
@@ -190,9 +191,14 @@ try {
 
     if ($result['paid']) {
         echo "\n=== PAYMENT SUCCESSFUL ===\n";
-    } else {
-        echo "\n=== PAYMENT PENDING/FAILED ===\n";
+        echo "Proofs have been marked SPENT and change stored.\n";
+    } elseif ($result['pending'] ?? false) {
+        echo "\n=== PAYMENT PENDING ===\n";
+        echo "Proofs have been marked PENDING.\n";
         echo "Check the melt quote status: " . $quote->quote . "\n";
+    } else {
+        echo "\n=== PAYMENT FAILED ===\n";
+        echo "Proofs remain UNSPENT - you can retry.\n";
     }
 
 } catch (InsufficientBalanceException $e) {

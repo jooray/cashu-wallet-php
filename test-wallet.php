@@ -443,8 +443,11 @@ class CashuWalletTester
                 }
 
                 echo "\nCurrent balance: " . $this->wallet->formatAmount(Wallet::sumProofs($this->proofs)) . "\n";
+            } elseif ($result['pending'] ?? false) {
+                warning("Payment is pending - proofs marked as pending");
+                echo "  Check melt quote status later to confirm payment\n";
             } else {
-                error("Payment failed or is pending");
+                error("Payment failed");
             }
 
         } catch (CashuException $e) {
@@ -590,8 +593,11 @@ class CashuWalletTester
                 }
 
                 echo "\nCurrent balance: " . $this->wallet->formatAmount(Wallet::sumProofs($this->proofs)) . "\n";
+            } elseif ($result['pending'] ?? false) {
+                warning("Payment is pending - proofs marked as pending");
+                echo "  Check melt quote status later to confirm payment\n";
             } else {
-                error("Payment failed or is pending");
+                error("Payment failed");
             }
 
         } catch (CashuException $e) {
