@@ -776,6 +776,119 @@ if (!empty($proofs)) {
 }
 ```
 
+## Offline Operations
+
+When the mint is unreachable, you can still perform read operations and export tokens using standalone storage access.
+
+### Get Balance Offline
+
+Check your local balance without connecting to the mint:
+
+```php
+use Cashu\WalletStorage;
+
+// Create storage directly (no Wallet, no mint connection)
+$storage = WalletStorage::forOffline(
+    '/path/to/wallet.db',
+    'https://mint.example.com',
+    'sat'
+);
+
+$balance = $storage->getBalance();
+echo "Offline balance: $balance sat\n";
+```
+
+### Export Tokens Offline
+
+Export tokens for later use when connectivity is restored:
+
+```php
+use Cashu\WalletStorage;
+use Cashu\TokenSerializer;
+use Cashu\ProofState;
+
+$storage = WalletStorage::forOffline('/path/to/wallet.db', 'https://mint.example.com', 'sat');
+
+// Get proofs as Proof objects
+$proofs = $storage->getProofsAsObjects();
+$balance = array_sum(array_map(fn($p) => $p->amount, $proofs));
+echo "Available: $balance sat\n";
+
+// Select proofs for export (manual selection for specific amount)
+$exportAmount = 100;
+$toExport = [];
+$remaining = $exportAmount;
+foreach ($proofs as $proof) {
+    if ($remaining <= 0) break;
+    $toExport[] = $proof;
+    $remaining -= $proof->amount;
+}
+
+// Serialize to token
+$token = TokenSerializer::serializeV4('https://mint.example.com', $toExport, 'sat');
+echo "Token: $token\n";
+
+// Mark exported proofs as PENDING to prevent double-spend
+$secrets = array_map(fn($p) => $p->secret, $toExport);
+$storage->updateProofsState($secrets, ProofState::PENDING);
+echo "Proofs marked as PENDING\n";
+```
+
+### Receiving Tokens Offline
+
+When the mint is unreachable, you can store received tokens without verification:
+
+```php
+use Cashu\Wallet;
+
+$wallet = new Wallet('https://mint.example.com', 'sat', '/path/to/wallet.db');
+// Note: loadMint() may fail if mint is unreachable, but receiveOffline works without it
+
+// Store token without swapping (trusts sender)
+try {
+    $proofs = $wallet->receiveOffline($tokenString);
+    echo "Stored " . count($proofs) . " proofs offline\n";
+} catch (CashuException $e) {
+    echo "Failed: " . $e->getMessage() . "\n";
+}
+
+// WARNING: Sender could double-spend these proofs!
+// Swap when mint is online to verify ownership:
+// $freshProofs = $wallet->receive($wallet->serializeToken($proofs));
+```
+
+### Offline vs Online Comparison
+
+| Operation | Online (Wallet) | Offline (WalletStorage) |
+|-----------|-----------------|-------------------------|
+| Get balance | `$wallet->getBalance()` | `$storage->getBalance()` |
+| Get proofs | `$wallet->getStoredProofs()` | `$storage->getProofsAsObjects()` |
+| Verify proofs | `$wallet->checkProofState($proofs)` | ❌ Not available |
+| Send tokens | `$wallet->split()` | ❌ Not available (needs swap) |
+| Export token | `$wallet->serializeToken($proofs)` | `TokenSerializer::serializeV4(...)` |
+| Mark pending | `$storage->updateProofsState(...)` | `$storage->updateProofsState(...)` |
+
+### Warning: Offline Limitations
+
+When working offline:
+
+1. **No verification** - Cannot confirm proofs are still unspent at the mint
+2. **Stale balance** - Proofs may have been spent by another wallet instance
+3. **Export risk** - Exported tokens might already be redeemed
+
+**Best practice:** When connectivity is restored, sync proof states:
+
+```php
+// After going back online
+$wallet = new Wallet('https://mint.example.com', 'sat', '/path/to/wallet.db');
+$wallet->loadMint();
+$wallet->initFromMnemonic('your seed phrase');
+
+// Sync local state with mint
+$result = $wallet->syncProofStates();
+echo "Synced: {$result['checked']} checked, {$result['updated']} spent\n";
+```
+
 ## Security Notes
 
 1. **Always save your seed phrase** before minting tokens

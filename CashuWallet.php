@@ -2634,6 +2634,70 @@ class WalletStorage
     }
 
     // ========================================================================
+    // OFFLINE STORAGE HELPERS
+    // ========================================================================
+
+    /**
+     * Static factory for offline (standalone) storage access
+     *
+     * Use this when you need to access stored proofs without connecting to a mint.
+     * Useful for balance checks, token export, or maintenance when the mint is unreachable.
+     *
+     * @param string $dbPath Path to SQLite database file
+     * @param string $mintUrl Mint URL (used to derive wallet ID)
+     * @param string $unit Currency unit (default: 'sat')
+     * @return self
+     */
+    public static function forOffline(string $dbPath, string $mintUrl, string $unit = 'sat'): self
+    {
+        return new self($dbPath, $mintUrl, $unit);
+    }
+
+    /**
+     * Get total balance of unspent proofs
+     *
+     * Calculates balance directly from storage without contacting the mint.
+     * Use this for quick balance checks or when the mint is unreachable.
+     *
+     * @return int Total balance in smallest unit
+     */
+    public function getBalance(): int
+    {
+        $stmt = $this->pdo->prepare("
+            SELECT COALESCE(SUM(amount), 0) as total
+            FROM cashu_proofs
+            WHERE wallet_id = ? AND state = ?
+        ");
+        $stmt->execute([$this->walletId, ProofState::UNSPENT]);
+        $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+        return (int)$row['total'];
+    }
+
+    /**
+     * Get proofs as Proof objects
+     *
+     * Converts stored proof data to Proof objects, including DLEQ if present.
+     * Use this when you need Proof objects for token serialization or other operations.
+     *
+     * @param string $state Proof state filter (default: UNSPENT)
+     * @return Proof[] Array of Proof objects
+     */
+    public function getProofsAsObjects(string $state = ProofState::UNSPENT): array
+    {
+        $rows = $this->getProofs($state);
+        return array_map(function($row) {
+            $dleq = null;
+            if (!empty($row['dleq'])) {
+                $dleqData = json_decode($row['dleq'], true);
+                if ($dleqData) {
+                    $dleq = new DLEQWallet($dleqData['e'], $dleqData['s'], $dleqData['r'] ?? null);
+                }
+            }
+            return new Proof($row['keyset_id'], (int)$row['amount'], $row['secret'], $row['C'], $dleq);
+        }, $rows);
+    }
+
+    // ========================================================================
     // COUNTER MANAGEMENT
     // ========================================================================
 
@@ -3783,6 +3847,41 @@ class Wallet
         // Split output amount into powers of 2
         $amounts = self::splitAmount($outputAmount);
         return $this->swap($token->proofs, $amounts);
+    }
+
+    /**
+     * Receive a token without swapping (offline/trust mode)
+     *
+     * WARNING: Does not swap proofs with the mint. The sender could double-spend
+     * by redeeming the same proofs elsewhere before you do. Use only when:
+     * - You trust the sender
+     * - You don't care about double-spend risk
+     * - The mint is unreachable and you need to store the token for later
+     *
+     * The proofs are stored directly in local storage without verification.
+     * You should swap them later when the mint is reachable.
+     *
+     * @param string $tokenString The cashuA/cashuB token string
+     * @return Proof[] The stored proofs
+     * @throws CashuException if token is from a different mint or storage is not configured
+     */
+    public function receiveOffline(string $tokenString): array
+    {
+        $token = $this->deserializeToken($tokenString);
+
+        // Verify token is from this mint
+        if (rtrim($token->mint, '/') !== $this->mintUrl) {
+            throw new CashuException('Token is from a different mint');
+        }
+
+        // Store proofs directly without swap
+        if ($this->storage) {
+            $this->storage->storeProofs($token->proofs);
+        } else {
+            throw new CashuException('No storage configured - cannot store offline tokens');
+        }
+
+        return $token->proofs;
     }
 
     // ========================================================================

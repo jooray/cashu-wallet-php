@@ -490,6 +490,41 @@ $newProofs = $wallet->receive($tokenString);
 
 ---
 
+#### receiveOffline()
+
+Receive a token without swapping (offline/trust mode).
+
+```php
+public function receiveOffline(string $tokenString): array
+```
+
+**Parameters:**
+- `$tokenString`: The cashuA/cashuB token string
+
+**Returns:** `Proof[]` - The stored proofs (unchanged from token)
+
+**Throws:**
+- `CashuException` if token is from a different mint
+- `CashuException` if storage is not configured
+
+**⚠️ Warning:** Does not swap proofs with the mint. The sender could double-spend
+by redeeming the same proofs elsewhere before you do. Use only when:
+- You trust the sender
+- You don't care about double-spend risk
+- The mint is unreachable and you need to store for later
+
+**Example:**
+```php
+// Store token without verification (offline mode)
+$proofs = $wallet->receiveOffline($tokenString);
+echo "Stored " . count($proofs) . " proofs offline\n";
+
+// Later, when mint is reachable, swap to verify ownership
+$freshProofs = $wallet->receive($wallet->serializeToken($proofs));
+```
+
+---
+
 ### Proof State Methods
 
 #### checkProofState()
@@ -1376,6 +1411,124 @@ public function getPdo(): \PDO
 ```
 
 Get the PDO instance for advanced operations.
+
+---
+
+### Offline Storage Helpers
+
+These methods enable working with stored proofs without connecting to a mint.
+
+#### forOffline() (Static Factory)
+
+```php
+public static function forOffline(string $dbPath, string $mintUrl, string $unit = 'sat'): self
+```
+
+Static factory for standalone storage access. Use when you need to access stored proofs without a full Wallet instance or when the mint is unreachable.
+
+**Parameters:**
+- `$dbPath`: Path to SQLite database file
+- `$mintUrl`: Mint URL (used to derive wallet ID)
+- `$unit`: Currency unit (default: `'sat'`)
+
+**Returns:** `WalletStorage` instance.
+
+**Example:**
+```php
+// Quick balance check without connecting to mint
+$storage = WalletStorage::forOffline('/path/to/wallet.db', 'https://mint.example.com', 'sat');
+$balance = $storage->getBalance();
+echo "Balance: $balance sat\n";
+```
+
+---
+
+#### getBalance()
+
+```php
+public function getBalance(): int
+```
+
+Get total balance of unspent proofs directly from storage.
+
+**Returns:** Total balance in smallest unit (satoshis, cents, etc.).
+
+**Example:**
+```php
+$storage = new WalletStorage('/path/to/wallet.db', 'https://mint.example.com', 'sat');
+$balance = $storage->getBalance();
+echo "Local balance: $balance sat\n";
+```
+
+---
+
+#### getProofsAsObjects()
+
+```php
+public function getProofsAsObjects(string $state = ProofState::UNSPENT): array
+```
+
+Get proofs as Proof objects with DLEQ data if present. Use when you need Proof objects for token serialization or other operations.
+
+**Parameters:**
+- `$state`: Proof state filter (default: `ProofState::UNSPENT`)
+
+**Returns:** `Proof[]` array of Proof objects.
+
+**Example:**
+```php
+$storage = WalletStorage::forOffline('/path/to/wallet.db', 'https://mint.example.com', 'sat');
+$proofs = $storage->getProofsAsObjects();
+
+// Serialize to token for offline export
+$token = TokenSerializer::serializeV4('https://mint.example.com', $proofs, 'sat');
+echo "Token: $token\n";
+```
+
+---
+
+### Standalone (Offline) Storage Usage
+
+WalletStorage can be used independently of the Wallet class for scenarios where:
+
+1. **Mint is unreachable** - Check balance or export tokens when network is down
+2. **Quick balance checks** - Avoid loading mint keysets just to check balance
+3. **Maintenance operations** - List proofs, clean up database, etc.
+4. **Integration with external systems** - Access proof data from other applications
+
+**Creating standalone storage:**
+
+```php
+use Cashu\WalletStorage;
+use Cashu\ProofState;
+
+// Option 1: Constructor
+$storage = new WalletStorage('/path/to/wallet.db', 'https://mint.example.com', 'sat');
+
+// Option 2: Static factory (more discoverable)
+$storage = WalletStorage::forOffline('/path/to/wallet.db', 'https://mint.example.com', 'sat');
+```
+
+**Common offline operations:**
+
+```php
+// Get balance
+$balance = $storage->getBalance();
+
+// Get proofs as objects (for serialization)
+$proofs = $storage->getProofsAsObjects(ProofState::UNSPENT);
+
+// Mark proofs as pending (for offline export)
+$secrets = array_map(fn($p) => $p->secret, $proofs);
+$storage->updateProofsState($secrets, ProofState::PENDING);
+```
+
+**⚠️ Warning: Offline operations do not verify with the mint**
+
+When working offline:
+- Balance may be stale (proofs could have been spent elsewhere)
+- Exported tokens may have already been redeemed
+- Use `syncProofStates()` via a full Wallet when connectivity is restored
 
 ---
 

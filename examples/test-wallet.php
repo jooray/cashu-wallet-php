@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/CashuWallet.php';
+require_once __DIR__ . '/../CashuWallet.php';
 
 use Cashu\Wallet;
 use Cashu\Proof;

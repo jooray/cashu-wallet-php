@@ -61,11 +61,8 @@ $proofs = $wallet->mint($quote->quote, 100);
 The library includes an interactive CLI testing tool:
 
 ```bash
-# Make executable
-chmod +x test-wallet.php
-
 # Run the test wallet
-./test-wallet.php
+php examples/test-wallet.php
 ```
 
 The test wallet provides a menu-driven interface to:
