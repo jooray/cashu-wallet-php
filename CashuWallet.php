@@ -2269,15 +2269,15 @@ class MintClient
     /**
      * Make a POST request
      */
-    public function post(string $path, array $data): array
+    public function post(string $path, array $data, ?int $timeout = null): array
     {
-        return $this->request('POST', $path, $data);
+        return $this->request('POST', $path, $data, $timeout);
     }
 
     /**
      * Make an HTTP request
      */
-    private function request(string $method, string $path, ?array $data = null): array
+    private function request(string $method, string $path, ?array $data = null, ?int $timeout = null): array
     {
         $url = $this->mintUrl . '/v1/' . ltrim($path, '/');
 
@@ -2285,7 +2285,7 @@ class MintClient
         curl_setopt_array($ch, [
             CURLOPT_URL => $url,
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => $this->timeout,
+            CURLOPT_TIMEOUT => $timeout ?? $this->timeout,
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
             CURLOPT_HTTPHEADER => [
@@ -2310,18 +2310,30 @@ class MintClient
             throw new CashuException("HTTP request failed: $error");
         }
 
+        if ($response === false || $response === '') {
+            // Empty body on a completed request is ambiguous — the mint may have processed
+            // the operation but a proxy/CDN dropped the body. Treat as an error so callers
+            // do NOT delete their recovery journal. See FABLE-CASHU-WALLET-PHP (F3).
+            throw new CashuException("HTTP request failed: empty response (HTTP $httpCode)");
+        }
+
         $decoded = json_decode($response, true);
 
         if ($httpCode >= 400) {
-            $errorMsg = $decoded['detail'] ?? "HTTP error $httpCode";
+            $errorMsg = (is_array($decoded) ? ($decoded['detail'] ?? null) : null) ?? "HTTP error $httpCode";
             if (is_array($errorMsg)) {
                 $errorMsg = json_encode($errorMsg);
             }
-            $errorCode = $decoded['code'] ?? null;
+            $errorCode = is_array($decoded) ? ($decoded['code'] ?? null) : null;
             throw new CashuProtocolException($errorMsg, $errorCode);
         }
 
-        return $decoded ?? [];
+        // A 2xx that isn't valid JSON is also ambiguous (HTML error page, truncation).
+        if ($decoded === null && strtolower(trim($response)) !== 'null') {
+            throw new CashuException("Invalid JSON response from mint (HTTP $httpCode)");
+        }
+
+        return is_array($decoded) ? $decoded : [];
     }
 }
 
@@ -2511,33 +2523,56 @@ class WalletStorage
      */
     public function storeProofs(array $proofs, ?string $quoteId = null): void
     {
+        if (empty($proofs)) {
+            return;
+        }
+
         $stmt = $this->pdo->prepare("
             INSERT OR REPLACE INTO cashu_proofs
             (wallet_id, keyset_id, amount, secret, C, dleq, state, mint_quote_id, created_at)
             VALUES (?, ?, ?, ?, ?, ?, 'UNSPENT', ?, ?)
         ");
 
-        $now = time();
-        foreach ($proofs as $proof) {
-            $dleq = null;
-            if ($proof->dleq !== null) {
-                $dleq = json_encode([
-                    'e' => $proof->dleq->e,
-                    's' => $proof->dleq->s,
-                    'r' => $proof->dleq->r
+        // Store all proofs atomically: either every proof of a mint/swap/melt-change is
+        // persisted, or none is. A crash mid-loop must not leave a partial set (which would
+        // silently lose the un-stored denominations). See FABLE-CASHU-WALLET-PHP (F4).
+        $ownTransaction = !$this->pdo->inTransaction();
+        if ($ownTransaction) {
+            $this->pdo->beginTransaction();
+        }
+
+        try {
+            $now = time();
+            foreach ($proofs as $proof) {
+                $dleq = null;
+                if ($proof->dleq !== null) {
+                    $dleq = json_encode([
+                        'e' => $proof->dleq->e,
+                        's' => $proof->dleq->s,
+                        'r' => $proof->dleq->r
+                    ]);
+                }
+
+                $stmt->execute([
+                    $this->walletId,
+                    $proof->id,
+                    $proof->amount,
+                    $proof->secret,
+                    $proof->C,
+                    $dleq,
+                    $quoteId,
+                    $now
                 ]);
             }
 
-            $stmt->execute([
-                $this->walletId,
-                $proof->id,
-                $proof->amount,
-                $proof->secret,
-                $proof->C,
-                $dleq,
-                $quoteId,
-                $now
-            ]);
+            if ($ownTransaction) {
+                $this->pdo->commit();
+            }
+        } catch (\Exception $e) {
+            if ($ownTransaction && $this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $e;
         }
     }
 
@@ -3610,9 +3645,20 @@ class Wallet
             'outputs' => $outputs
         ]);
 
+        // Guard: the mint must return exactly one signature per output. A short/empty set
+        // means an incomplete response — do NOT proceed to store proofs and delete the
+        // recovery journal, or the quote's funds would be lost. See FABLE-CASHU-WALLET-PHP (F3).
+        $signatures = $response['signatures'] ?? [];
+        if (count($signatures) !== count($outputs)) {
+            throw new CashuException(
+                'Mint returned ' . count($signatures) . ' signatures for ' . count($outputs)
+                . ' outputs; keeping recovery journal for retry'
+            );
+        }
+
         // Unblind signatures to create proofs
         $proofs = [];
-        foreach ($response['signatures'] ?? [] as $i => $sig) {
+        foreach ($signatures as $i => $sig) {
             $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
             $C = Crypto::unblindSignature($sig['C_'], $blindingData[$i]['r'], $pubkey);
 
@@ -3744,12 +3790,14 @@ class Wallet
             }
         }
 
-        // Send melt request
+        // Send melt request. Lightning settlement can take well over the default 30s, so
+        // allow a longer timeout here specifically. On timeout the caller should re-check
+        // the melt quote state rather than assume failure. See FABLE-CASHU-WALLET-PHP (F6).
         $response = $this->client->post('melt/bolt11', [
             'quote' => $quoteId,
             'inputs' => array_map(fn($p) => $p->toArray(), $proofs),
             'outputs' => $outputs
-        ]);
+        ], 120);
 
         // Process change
         $changeProofs = [];
