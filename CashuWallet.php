@@ -4733,8 +4733,11 @@ class Wallet
      *               'byUnit' contains ['unit' => ['proofs' => [], 'counters' => []]]
      */
     public function restore(
-        int $batchSize = 25,
-        int $emptyBatches = 3,
+        // Wider gap tolerance by default: failed operations burn counters, leaving gaps.
+        // A small window (was 25*3=75) could stop before reaching later funds. See
+        // FABLE-CASHU-WALLET-PHP (F8).
+        int $batchSize = 100,
+        int $emptyBatches = 5,
         ?callable $progressCallback = null,
         bool $allUnits = true
     ): array {
@@ -4893,7 +4896,11 @@ class Wallet
                     }
 
                     foreach ($unitCounters as $keysetId => $counterVal) {
-                        $unitStorage->setCounter($keysetId, $counterVal);
+                        // Never lower a persisted counter: if this wallet is (or was) in
+                        // active use, a restore that computed a smaller value must not cause
+                        // secret reuse. See FABLE-CASHU-WALLET-PHP (F10).
+                        $existing = $unitStorage->getCounter($keysetId);
+                        $unitStorage->setCounter($keysetId, max($existing, $counterVal));
                     }
                 }
             }
