@@ -2361,7 +2361,7 @@ class WalletStorage
      * @param string $mintUrl Mint URL (used to create wallet ID for multi-wallet support)
      * @param string $unit Currency unit (e.g., 'sat', 'eur') - different units have separate wallets
      */
-    public function __construct(string $dbPath, string $mintUrl, string $unit = 'sat')
+    public function __construct(string $dbPath, string $mintUrl, string $unit = 'sat', ?string $storageIdentity = null)
     {
         // Ensure directory exists
         $dir = dirname($dbPath);
@@ -2373,8 +2373,20 @@ class WalletStorage
         $this->pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
         $this->pdo->exec('PRAGMA journal_mode = WAL');
         $this->pdo->exec('PRAGMA busy_timeout = 5000');
-        $this->walletId = substr(hash('sha256', $mintUrl . ':' . $unit), 0, 16);
+        $this->walletId = self::deriveWalletId($mintUrl, $unit, $storageIdentity);
         $this->initSchema();
+    }
+
+    public static function deriveWalletId(
+        string $mintUrl,
+        string $unit = 'sat',
+        ?string $storageIdentity = null
+    ): string {
+        $identityMaterial = rtrim($mintUrl, '/') . ':' . strtolower($unit);
+        if ($storageIdentity !== null && $storageIdentity !== '') {
+            $identityMaterial .= ':account:' . $storageIdentity;
+        }
+        return substr(hash('sha256', $identityMaterial), 0, 16);
     }
 
     /**
@@ -2419,6 +2431,13 @@ class WalletStorage
                 expires_at INTEGER
             );
 
+            CREATE TABLE IF NOT EXISTS cashu_wallet_metadata (
+                wallet_id TEXT PRIMARY KEY,
+                seed_fingerprint TEXT NOT NULL,
+                ready INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_proofs_wallet_state
                 ON cashu_proofs(wallet_id, state);
             CREATE INDEX IF NOT EXISTS idx_proofs_secret
@@ -2448,6 +2467,70 @@ class WalletStorage
     public function getPdo(): \PDO
     {
         return $this->pdo;
+    }
+
+    /** Return whether this account has any state predating seed metadata. */
+    public function hasWalletData(): bool
+    {
+        foreach (['cashu_proofs', 'cashu_counters', 'cashu_pending_operations'] as $table) {
+            $stmt = $this->pdo->prepare("SELECT 1 FROM $table WHERE wallet_id = ? LIMIT 1");
+            $stmt->execute([$this->walletId]);
+            if ($stmt->fetchColumn() !== false) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public function getSeedFingerprint(): ?string
+    {
+        $stmt = $this->pdo->prepare('SELECT seed_fingerprint FROM cashu_wallet_metadata WHERE wallet_id = ?');
+        $stmt->execute([$this->walletId]);
+        $value = $stmt->fetchColumn();
+        return $value === false ? null : (string)$value;
+    }
+
+    public function isSeedReady(): bool
+    {
+        $stmt = $this->pdo->prepare('SELECT ready FROM cashu_wallet_metadata WHERE wallet_id = ?');
+        $stmt->execute([$this->walletId]);
+        return (int)$stmt->fetchColumn() === 1;
+    }
+
+    /** Bind a seed to this account. Callers must explicitly choose new or legacy adoption. */
+    public function bindSeedFingerprint(string $fingerprint, bool $expectEmpty, bool $ready = true): void
+    {
+        $this->pdo->exec('BEGIN IMMEDIATE');
+        try {
+            $existing = $this->getSeedFingerprint();
+            if ($existing !== null && !hash_equals($existing, $fingerprint)) {
+                throw new CashuException('Storage is already bound to a different wallet seed');
+            }
+            if ($existing === null && $expectEmpty && $this->hasWalletData()) {
+                throw new CashuException('Cannot initialize a new seed on storage containing wallet data');
+            }
+            if ($existing === null) {
+                $stmt = $this->pdo->prepare(
+                    'INSERT INTO cashu_wallet_metadata (wallet_id, seed_fingerprint, ready, created_at) VALUES (?, ?, ?, ?)'
+                );
+                $stmt->execute([$this->walletId, $fingerprint, $ready ? 1 : 0, time()]);
+            }
+            $this->pdo->exec('COMMIT');
+        } catch (\Throwable $e) {
+            try { $this->pdo->exec('ROLLBACK'); } catch (\Throwable $ignored) {}
+            throw $e;
+        }
+    }
+
+    public function markSeedReady(): void
+    {
+        $stmt = $this->pdo->prepare(
+            'UPDATE cashu_wallet_metadata SET ready = 1 WHERE wallet_id = ? AND seed_fingerprint IS NOT NULL'
+        );
+        $stmt->execute([$this->walletId]);
+        if ($stmt->rowCount() !== 1) {
+            throw new CashuException('Cannot mark uninitialized storage ready');
+        }
     }
 
     /**
@@ -2818,6 +2901,110 @@ class WalletStorage
         return $counters;
     }
 
+    /**
+     * Atomically reserve spend inputs, allocate deterministic outputs, and journal
+     * the operation before any mint request. Inputs not already in this storage
+     * (for example received tokens) are durably imported in PENDING state.
+     *
+     * @param Proof[] $proofs
+     * @param int[] $amounts
+     */
+    public function preparePendingSpend(
+        string $id,
+        string $type,
+        array $proofs,
+        string $keysetId,
+        array $amounts,
+        array $extraData = []
+    ): array {
+        $inputSecrets = array_map(fn($proof) => $proof->secret, $proofs);
+        if (count($inputSecrets) !== count(array_unique($inputSecrets))) {
+            throw new CashuException('Cannot reserve duplicate input proofs');
+        }
+
+        $this->pdo->exec('BEGIN IMMEDIATE');
+        try {
+            $existing = $this->getPendingOperationById($id);
+            if ($existing !== null) {
+                $data = $existing['data'];
+                if ($existing['type'] !== $type || ($data['input_secrets'] ?? []) !== $inputSecrets) {
+                    throw new CashuException("Pending operation ID collision: $id");
+                }
+                $this->pdo->exec('COMMIT');
+                return $data;
+            }
+
+            $select = $this->pdo->prepare(
+                'SELECT state FROM cashu_proofs WHERE wallet_id = ? AND secret = ?'
+            );
+            $update = $this->pdo->prepare(
+                'UPDATE cashu_proofs SET state = ?, spent_at = NULL WHERE wallet_id = ? AND secret = ?'
+            );
+            $insert = $this->pdo->prepare("\n                INSERT INTO cashu_proofs\n                (wallet_id, keyset_id, amount, secret, C, dleq, state, mint_quote_id, created_at)\n                VALUES (?, ?, ?, ?, ?, ?, 'PENDING', NULL, ?)\n            ");
+
+            foreach ($proofs as $proof) {
+                $select->execute([$this->walletId, $proof->secret]);
+                $state = $select->fetchColumn();
+                if ($state !== false && $state !== ProofState::UNSPENT) {
+                    throw new CashuException("Cannot reserve proof: state is $state");
+                }
+                if ($state === false) {
+                    $dleq = $proof->dleq === null ? null : json_encode([
+                        'e' => $proof->dleq->e,
+                        's' => $proof->dleq->s,
+                        'r' => $proof->dleq->r,
+                    ]);
+                    $insert->execute([
+                        $this->walletId, $proof->id, $proof->amount, $proof->secret,
+                        $proof->C, $dleq, time(),
+                    ]);
+                } else {
+                    $update->execute([ProofState::PENDING, $this->walletId, $proof->secret]);
+                }
+            }
+
+            $counterStart = $this->getCounter($keysetId);
+            if (!empty($amounts)) {
+                $this->setCounter($keysetId, $counterStart + count($amounts));
+            }
+            $data = array_merge($extraData, [
+                'counter_start' => $counterStart,
+                'keyset_id' => $keysetId,
+                'amounts' => array_values($amounts),
+                'input_secrets' => $inputSecrets,
+            ]);
+            $this->savePendingOperation($id, $type, $data, $extraData['expires_at'] ?? null);
+            $this->pdo->exec('COMMIT');
+            return $data;
+        } catch (\Throwable $e) {
+            try { $this->pdo->exec('ROLLBACK'); } catch (\Throwable $ignored) {}
+            throw $e;
+        }
+    }
+
+    /** Atomically persist outputs, transition inputs, and remove the journal. */
+    public function finalizePendingSpend(
+        string $id,
+        array $inputSecrets,
+        string $inputState,
+        array $outputProofs = []
+    ): void {
+        $this->pdo->beginTransaction();
+        try {
+            if (!empty($outputProofs)) {
+                $this->storeProofs($outputProofs);
+            }
+            $this->updateProofsState($inputSecrets, $inputState);
+            $this->deletePendingOperation($id);
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $e;
+        }
+    }
+
     // ========================================================================
     // PENDING OPERATIONS (for crash recovery)
     // ========================================================================
@@ -2838,7 +3025,7 @@ class WalletStorage
             VALUES (?, ?, ?, ?, ?, ?)
         ");
         $stmt->execute([
-            $id,
+            $this->scopedOperationId($id),
             $this->walletId,
             $type,
             json_encode($data),
@@ -2860,9 +3047,15 @@ class WalletStorage
             FROM cashu_pending_operations
             WHERE id = ? AND wallet_id = ?
         ");
-        $stmt->execute([$id, $this->walletId]);
+        $stmt->execute([$this->scopedOperationId($id), $this->walletId]);
         $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+        if (!$row) {
+            // Journals created before account-scoped IDs used the public ID directly.
+            $stmt->execute([$id, $this->walletId]);
+            $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+        }
         if ($row) {
+            $row['id'] = $id;
             $row['data'] = json_decode($row['data'], true);
         }
         return $row ?: null;
@@ -2896,6 +3089,7 @@ class WalletStorage
 
         $ops = [];
         while ($row = $stmt->fetch(\PDO::FETCH_ASSOC)) {
+            $row['id'] = $this->unscopedOperationId($row['id']);
             $row['data'] = json_decode($row['data'], true);
             $ops[] = $row;
         }
@@ -2912,9 +3106,20 @@ class WalletStorage
     {
         $stmt = $this->pdo->prepare("
             DELETE FROM cashu_pending_operations
-            WHERE id = ? AND wallet_id = ?
+            WHERE id IN (?, ?) AND wallet_id = ?
         ");
-        $stmt->execute([$id, $this->walletId]);
+        $stmt->execute([$this->scopedOperationId($id), $id, $this->walletId]);
+    }
+
+    private function scopedOperationId(string $id): string
+    {
+        return $this->walletId . ':' . $id;
+    }
+
+    private function unscopedOperationId(string $id): string
+    {
+        $prefix = $this->walletId . ':';
+        return str_starts_with($id, $prefix) ? substr($id, strlen($prefix)) : $id;
     }
 
     /**
@@ -2928,7 +3133,8 @@ class WalletStorage
     {
         $stmt = $this->pdo->prepare("
             DELETE FROM cashu_pending_operations
-            WHERE wallet_id = ? AND expires_at IS NOT NULL AND expires_at < ?
+            WHERE wallet_id = ? AND type NOT IN ('melt', 'swap')
+              AND expires_at IS NOT NULL AND expires_at < ?
         ");
         $stmt->execute([$this->walletId, time()]);
         return $stmt->rowCount();
@@ -3014,6 +3220,8 @@ class Wallet
     // SQLite storage
     private ?WalletStorage $storage = null;
     private ?string $dbPath = null;
+    private ?string $storageIdentity = null;
+    private bool $seedReadyForSpending = false;
 
     /**
      * Create a new wallet instance
@@ -3021,8 +3229,14 @@ class Wallet
      * @param string $mintUrl URL of the Cashu mint
      * @param string $unit Unit of account (e.g., 'sat', 'usd', 'eur')
      * @param string|null $dbPath Optional path to SQLite database for persistence
+     * @param string|null $storageIdentity Stable account identity for isolating wallets
      */
-    public function __construct(string $mintUrl, string $unit = 'sat', ?string $dbPath = null)
+    public function __construct(
+        string $mintUrl,
+        string $unit = 'sat',
+        ?string $dbPath = null,
+        ?string $storageIdentity = null
+    )
     {
         $this->mintUrl = rtrim($mintUrl, '/');
         $this->unit = $unit;
@@ -3031,7 +3245,8 @@ class Wallet
 
         if ($dbPath !== null) {
             $this->dbPath = $dbPath;
-            $this->storage = new WalletStorage($dbPath, $this->mintUrl, $this->unit);
+            $this->storageIdentity = $storageIdentity;
+            $this->storage = new WalletStorage($dbPath, $this->mintUrl, $this->unit, $storageIdentity);
         }
     }
 
@@ -3310,18 +3525,15 @@ class Wallet
                 $state = strtoupper($quote->state);
 
                 if ($state === 'PAID') {
-                    // Payment successful - mark proofs as spent
                     $inputSecrets = $op['data']['input_secrets'] ?? [];
-                    if (!empty($inputSecrets)) {
-                        $this->storage->updateProofsState($inputSecrets, ProofState::SPENT);
-                    }
-
-                    // Recover change proofs if available
-                    $changeAmount = $this->recoverMeltChange($op['data'], $quote);
-                    $result['change_recovered'] += $changeAmount;
-
-                    // Clean up pending operation
-                    $this->storage->deletePendingOperation($pendingId);
+                    $changeProofs = $this->recoverMeltChange($op['data'], $quote);
+                    $this->storage->finalizePendingSpend(
+                        $pendingId,
+                        $inputSecrets,
+                        ProofState::SPENT,
+                        $changeProofs
+                    );
+                    $result['change_recovered'] += self::sumProofs($changeProofs);
                     $result['paid']++;
 
                 } elseif ($state === 'PENDING') {
@@ -3334,12 +3546,12 @@ class Wallet
                     $expired = $quote->expiry !== null && $quote->expiry < $now;
 
                     if ($expired) {
-                        // Quote expired - restore proofs to UNSPENT
                         $inputSecrets = $op['data']['input_secrets'] ?? [];
-                        if (!empty($inputSecrets)) {
-                            $this->storage->updateProofsState($inputSecrets, ProofState::UNSPENT);
-                        }
-                        $this->storage->deletePendingOperation($pendingId);
+                        $this->storage->finalizePendingSpend(
+                            $pendingId,
+                            $inputSecrets,
+                            ProofState::UNSPENT
+                        );
                         $result['restored']++;
                     } else {
                         // Not expired yet - user might still complete payment
@@ -3362,13 +3574,13 @@ class Wallet
      *
      * @param array $pendingData Pending operation data with counter_start, keyset_id, amounts
      * @param MeltQuote $quote Quote response containing change signatures
-     * @return int Total amount of recovered change (in unit)
+     * @return Proof[] Recovered change proofs
      */
-    private function recoverMeltChange(array $pendingData, MeltQuote $quote): int
+    private function recoverMeltChange(array $pendingData, MeltQuote $quote): array
     {
         // No change signatures in quote response
         if (empty($quote->change)) {
-            return 0;
+            return [];
         }
 
         $counterStart = $pendingData['counter_start'] ?? null;
@@ -3377,7 +3589,7 @@ class Wallet
 
         // Need counter data to regenerate blinding factors
         if ($counterStart === null || $keysetId === null || empty($amounts)) {
-            return 0;
+            return [];
         }
 
         // Rebuild blinding data from stored counter range
@@ -3389,7 +3601,6 @@ class Wallet
 
         // Unblind change signatures and store proofs
         $changeProofs = [];
-        $totalAmount = 0;
 
         foreach ($quote->change as $i => $sig) {
             if (!isset($blindingData[$i])) {
@@ -3407,14 +3618,97 @@ class Wallet
             );
 
             $changeProofs[] = $proof;
-            $totalAmount += $sig['amount'];
         }
 
-        if (!empty($changeProofs)) {
-            $this->storage->storeProofs($changeProofs);
+        return $changeProofs;
+    }
+
+    /** Recover or release swaps left ambiguous by a crash or timeout. */
+    public function recoverPendingSwaps(): array
+    {
+        $result = ['checked' => 0, 'recovered' => 0, 'released' => 0, 'still_pending' => 0, 'errors' => []];
+        if (!$this->storage) {
+            return $result;
         }
 
-        return $totalAmount;
+        foreach ($this->storage->getPendingOperations('swap') as $op) {
+            $result['checked']++;
+            try {
+                $data = $op['data'];
+                $secrets = $data['input_secrets'] ?? [];
+                $Ys = [];
+                foreach ($secrets as $secret) {
+                    $Ys[] = bin2hex(Secp256k1::compressPoint(Crypto::hashToCurve($secret)));
+                }
+                $response = $this->client->post('checkstate', ['Ys' => $Ys]);
+                $states = array_map(
+                    fn($state) => strtoupper($state['state'] ?? ''),
+                    $response['states'] ?? []
+                );
+                if (count($states) !== count($secrets)) {
+                    throw new CashuException('Mint returned incomplete input state response');
+                }
+
+                if (!empty($states) && count(array_filter($states, fn($state) => $state === ProofState::SPENT)) === count($states)) {
+                    $proofs = $this->recoverPendingOutputs($data);
+                    if (count($proofs) !== count($data['amounts'] ?? [])) {
+                        $result['still_pending']++;
+                        continue;
+                    }
+                    $this->storage->finalizePendingSpend($op['id'], $secrets, ProofState::SPENT, $proofs);
+                    $result['recovered']++;
+                } elseif (!empty($states) && count(array_filter($states, fn($state) => $state === ProofState::UNSPENT)) === count($states)) {
+                    // A timed-out request may still be queued at the mint. Keep inputs
+                    // reserved instead of making them available to a competing spend.
+                    $result['still_pending']++;
+                } else {
+                    $result['still_pending']++;
+                }
+            } catch (\Throwable $e) {
+                $result['errors'][$op['id']] = $e->getMessage();
+            }
+        }
+        return $result;
+    }
+
+    /** @return Proof[] */
+    private function recoverPendingOutputs(array $data): array
+    {
+        $outputs = [];
+        $blindingByOutput = [];
+        foreach (($data['amounts'] ?? []) as $i => $amount) {
+            $blinded = $this->createDeterministicBlindedMessage(
+                $data['keyset_id'],
+                $data['counter_start'] + $i
+            );
+            $output = ['amount' => $amount, 'id' => $data['keyset_id'], 'B_' => $blinded['B_']];
+            $outputs[] = $output;
+            $blindingByOutput[$blinded['B_'] . ':' . $amount] = $blinded;
+        }
+        if (empty($outputs)) {
+            return [];
+        }
+
+        $response = $this->client->post('restore', ['outputs' => $outputs]);
+        $returnedOutputs = $response['outputs'] ?? [];
+        $signatures = $response['signatures'] ?? [];
+        $proofs = [];
+        foreach ($signatures as $i => $signature) {
+            $output = $returnedOutputs[$i] ?? null;
+            $key = $output === null ? '' : ($output['B_'] ?? '') . ':' . ($output['amount'] ?? '');
+            if (!isset($blindingByOutput[$key])) {
+                continue;
+            }
+            $blinded = $blindingByOutput[$key];
+            $pubkey = $this->getPublicKey($signature['id'], $signature['amount']);
+            $proofs[] = new Proof(
+                $signature['id'],
+                $signature['amount'],
+                $blinded['secret'],
+                Crypto::unblindSignature($signature['C_'], $blinded['r'], $pubkey)
+            );
+        }
+        return $proofs;
     }
 
     /**
@@ -3723,16 +4017,10 @@ class Wallet
      */
     public function melt(string $quoteId, array $proofs): array
     {
-        // Validate proof states before spending
-        if ($this->storage) {
-            $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
-            $states = $this->storage->getProofsStatesBySecrets($inputSecrets);
-            foreach ($states as $secret => $state) {
-                if ($state !== ProofState::UNSPENT) {
-                    throw new CashuException("Cannot spend proof: state is $state");
-                }
-            }
+        if (!$this->storage) {
+            throw new CashuException('Melt requires persistent storage for input reservation and recovery');
         }
+        $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
 
         $keysetId = $this->getActiveKeysetId();
         $proofsSum = self::sumProofs($proofs);
@@ -3744,7 +4032,6 @@ class Wallet
         // Calculate change amount
         $changeAmount = $proofsSum - $totalNeeded;
 
-        // Check for pending operation (retry case)
         $pendingId = "melt:$quoteId";
         $pending = $this->storage ? $this->storage->getPendingOperationById($pendingId) : null;
 
@@ -3756,38 +4043,29 @@ class Wallet
             $this->requireSeed();
             $this->requireSafeState();
 
-            if ($pending) {
-                // RETRY: rebuild blinding data from stored counter range
-                $counterStart = $pending['data']['counter_start'];
-                $pendingKeysetId = $pending['data']['keyset_id'];
-                $changeAmounts = $pending['data']['amounts'];
-                foreach ($changeAmounts as $i => $amt) {
-                    $blinded = $this->createDeterministicBlindedMessage($pendingKeysetId, $counterStart + $i);
-                    $outputs[] = ['amount' => $amt, 'id' => $pendingKeysetId, 'B_' => $blinded['B_']];
-                    $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
-                }
-                $keysetId = $pendingKeysetId;
-            } else {
-                // FIRST ATTEMPT: increment counters and record pending op
-                $changeAmounts = self::splitAmount($changeAmount);
-                $counterStart = $this->getCounter($keysetId);
-                foreach ($changeAmounts as $amt) {
-                    $counter = $this->nextCounter($keysetId);
-                    $blinded = $this->createDeterministicBlindedMessage($keysetId, $counter);
-                    $outputs[] = ['amount' => $amt, 'id' => $keysetId, 'B_' => $blinded['B_']];
-                    $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
-                }
-                // Record pending operation before network call
-                if ($this->storage) {
-                    $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
-                    $this->storage->savePendingOperation($pendingId, 'melt', [
-                        'counter_start' => $counterStart,
-                        'keyset_id' => $keysetId,
-                        'amounts' => $changeAmounts,
-                        'input_secrets' => $inputSecrets,
-                    ]);
-                }
-            }
+            $changeAmounts = $pending ? $pending['data']['amounts'] : self::splitAmount($changeAmount);
+        }
+
+        $pendingData = $pending
+            ? $pending['data']
+            : $this->storage->preparePendingSpend(
+                $pendingId,
+                'melt',
+                $proofs,
+                $keysetId,
+                $changeAmounts ?? [],
+                ['quote_expiry' => $quote->expiry, 'expires_at' => $quote->expiry]
+            );
+        if (($pendingData['input_secrets'] ?? []) !== $inputSecrets) {
+            throw new CashuException('Pending melt inputs do not match supplied proofs');
+        }
+        $keysetId = $pendingData['keyset_id'];
+        $counterStart = $pendingData['counter_start'];
+        $changeAmounts = $pendingData['amounts'];
+        foreach ($changeAmounts as $i => $amt) {
+            $blinded = $this->createDeterministicBlindedMessage($keysetId, $counterStart + $i);
+            $outputs[] = ['amount' => $amt, 'id' => $keysetId, 'B_' => $blinded['B_']];
+            $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
         }
 
         // Send melt request. Lightning settlement can take well over the default 30s, so
@@ -3801,7 +4079,16 @@ class Wallet
 
         // Process change
         $changeProofs = [];
-        foreach ($response['change'] ?? [] as $i => $sig) {
+        $changeSignatures = $response['change'] ?? [];
+        if (count($changeSignatures) > count($blindingData)) {
+            throw new CashuException('Mint returned more melt change signatures than prepared outputs');
+        }
+        foreach ($changeSignatures as $i => $sig) {
+            if (!isset($blindingData[$i])
+                || ($sig['id'] ?? null) !== $keysetId
+                || (int)($sig['amount'] ?? -1) !== (int)$blindingData[$i]['amount']) {
+                throw new CashuException('Mint returned melt change that does not match the prepared outputs');
+            }
             $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
             $C = Crypto::unblindSignature($sig['C_'], $blindingData[$i]['r'], $pubkey);
 
@@ -3818,37 +4105,16 @@ class Wallet
         $isPaid = $paymentState === 'PAID';
         $isPending = $paymentState === 'PENDING';
 
-        // Auto-persist proof states to storage
-        if ($this->storage) {
-            $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
-
-            if ($isPaid) {
-                // Payment successful - mark proofs as spent, store change, clean up
-                $this->storage->updateProofsState($inputSecrets, ProofState::SPENT);
-
-                if (!empty($changeProofs)) {
-                    $this->storage->storeProofs($changeProofs);
-                }
-
-                $this->storage->deletePendingOperation($pendingId);
-            } elseif ($isPending) {
-                // Payment in progress - mark proofs as pending, keep pending op for recovery
-                $this->storage->updateProofsState($inputSecrets, ProofState::PENDING);
-                // Ensure pending operation exists for recovery (covers no-change case)
-                if (!$pending) {
-                    $this->storage->savePendingOperation($pendingId, 'melt', [
-                        'counter_start' => $counterStart ?? 0,
-                        'keyset_id' => $keysetId,
-                        'amounts' => $changeAmounts ?? [],
-                        'input_secrets' => $inputSecrets,
-                    ]);
-                }
-                // Don't store change yet - payment hasn't completed
-                // Don't delete pending operation - needed for recovery/retry
-                $changeProofs = []; // Clear change - not valid until payment completes
-            }
-            // If neither PAID nor PENDING (e.g., UNPAID/failed), leave proofs as UNSPENT
-            // and don't delete pending operation
+        if ($isPaid) {
+            $this->storage->finalizePendingSpend(
+                $pendingId,
+                $inputSecrets,
+                ProofState::SPENT,
+                $changeProofs
+            );
+        } else {
+            // Ambiguous and unpaid responses remain reserved until quote recovery decides.
+            $changeProofs = [];
         }
 
         return [
@@ -3885,23 +4151,33 @@ class Wallet
         $this->requireSeed();
         $this->requireSafeState();
 
-        // Validate proof states before spending
-        if ($this->storage) {
-            $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
-            $states = $this->storage->getProofsStatesBySecrets($inputSecrets);
-            foreach ($states as $secret => $state) {
-                if ($state !== ProofState::UNSPENT) {
-                    throw new CashuException("Cannot spend proof: state is $state");
-                }
-            }
+        if (!$this->storage) {
+            throw new CashuException('Swap requires persistent storage for input reservation and recovery');
+        }
+
+        $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
+        $pendingId = 'swap:' . hash('sha256', implode("\0", $inputSecrets));
+        $pending = $this->storage->getPendingOperationById($pendingId);
+        $pendingData = $pending
+            ? $pending['data']
+            : $this->storage->preparePendingSpend(
+                $pendingId,
+                'swap',
+                $proofs,
+                $keysetId,
+                $amounts
+            );
+        if (($pendingData['amounts'] ?? []) !== array_values($amounts)) {
+            throw new CashuException('Pending swap outputs do not match requested amounts');
         }
 
         $outputs = [];
         $blindingData = [];
 
-        foreach ($amounts as $amt) {
-            // Use deterministic secrets (NUT-13)
-            $counter = $this->nextCounter($keysetId);
+        $keysetId = $pendingData['keyset_id'];
+        $counterStart = $pendingData['counter_start'];
+        foreach ($pendingData['amounts'] as $i => $amt) {
+            $counter = $counterStart + $i;
             $blinded = $this->createDeterministicBlindedMessage($keysetId, $counter);
             $secret = $blinded['secret'];
 
@@ -3924,9 +4200,14 @@ class Wallet
             'outputs' => $outputs
         ]);
 
+        $signatures = $response['signatures'] ?? [];
+        if (count($signatures) !== count($outputs)) {
+            throw new CashuException('Mint returned an incomplete swap response; recovery journal retained');
+        }
+
         // Unblind signatures
         $newProofs = [];
-        foreach ($response['signatures'] ?? [] as $i => $sig) {
+        foreach ($signatures as $i => $sig) {
             $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
             $C = Crypto::unblindSignature($sig['C_'], $blindingData[$i]['r'], $pubkey);
 
@@ -3938,15 +4219,12 @@ class Wallet
             );
         }
 
-        // Auto-persist proof states to storage
-        if ($this->storage) {
-            // Mark input proofs as spent
-            $inputSecrets = array_map(fn($p) => $p->secret, $proofs);
-            $this->storage->updateProofsState($inputSecrets, ProofState::SPENT);
-
-            // Store new proofs
-            $this->storage->storeProofs($newProofs);
-        }
+        $this->storage->finalizePendingSpend(
+            $pendingId,
+            $inputSecrets,
+            ProofState::SPENT,
+            $newProofs
+        );
 
         return $newProofs;
     }
@@ -4243,13 +4521,73 @@ class Wallet
      */
     public function initFromMnemonic(string $mnemonic, string $passphrase = ''): void
     {
+        $this->initializeSeed($mnemonic, $passphrase, 'existing');
+    }
+
+    /** Initialize storage for a seed guaranteed never to have been used before. */
+    public function initializeNewFromMnemonic(string $mnemonic, string $passphrase = ''): void
+    {
+        $this->initializeSeed($mnemonic, $passphrase, 'new');
+    }
+
+    /** Bind pre-fingerprint storage after the application verifies it belongs to this seed. */
+    public function adoptSeedForExistingStorage(string $mnemonic, string $passphrase = ''): void
+    {
+        $this->initializeSeed($mnemonic, $passphrase, 'adopt');
+    }
+
+    /** Bind a fresh account for restore; spending stays disabled until restore() completes. */
+    public function initializeForRestore(string $mnemonic, string $passphrase = ''): void
+    {
+        $this->initializeSeed($mnemonic, $passphrase, 'restore');
+    }
+
+    public static function calculateSeedFingerprint(string $mnemonic, string $passphrase = ''): string
+    {
+        if (!Mnemonic::validate($mnemonic)) {
+            throw new CashuException('Invalid mnemonic phrase');
+        }
+        $seed = Mnemonic::toSeed($mnemonic, $passphrase);
+        return hash('sha256', "cashu-wallet-php seed fingerprint\0" . $seed);
+    }
+
+    private function initializeSeed(string $mnemonic, string $passphrase, string $mode): void
+    {
         if (!Mnemonic::validate($mnemonic)) {
             throw new CashuException('Invalid mnemonic phrase');
         }
 
-        $this->mnemonic = $mnemonic;
         $seed = Mnemonic::toSeed($mnemonic, $passphrase);
+        $fingerprint = self::calculateSeedFingerprint($mnemonic, $passphrase);
+
+        if (!$this->storage) {
+            // Keep legacy seed-only restore workflows available, but never allow
+            // them to generate new counters or spend.
+        } else {
+            $existing = $this->storage->getSeedFingerprint();
+            if ($mode === 'existing') {
+                if ($existing === null) {
+                    throw new CashuException(
+                        'Storage has no seed fingerprint. Use initializeNewFromMnemonic(), ' .
+                        'adoptSeedForExistingStorage(), or initializeForRestore() explicitly.'
+                    );
+                }
+                if (!hash_equals($existing, $fingerprint)) {
+                    throw new CashuException('Storage is bound to a different wallet seed');
+                }
+            } elseif ($mode === 'new' || $mode === 'restore') {
+                if ($existing !== null) {
+                    throw new CashuException('Storage account is already initialized');
+                }
+                $this->storage->bindSeedFingerprint($fingerprint, true, $mode === 'new');
+            } elseif ($mode === 'adopt') {
+                $this->storage->bindSeedFingerprint($fingerprint, false);
+            }
+        }
+
+        $this->mnemonic = $mnemonic;
         $this->bip32 = BIP32::fromSeed($seed);
+        $this->seedReadyForSpending = $this->storage?->isSeedReady() ?? false;
 
         // Load counters from storage if available
         if ($this->storage) {
@@ -4292,7 +4630,7 @@ class Wallet
         }
 
         $mnemonic = Mnemonic::generate();
-        $this->initFromMnemonic($mnemonic);
+        $this->initializeNewFromMnemonic($mnemonic);
         return $mnemonic;
     }
 
@@ -4323,7 +4661,7 @@ class Wallet
      */
     public function requiresRecovery(): bool
     {
-        return $this->hasSeed() && !$this->hasStorage();
+        return $this->hasSeed() && (!$this->hasStorage() || !$this->seedReadyForSpending);
     }
 
     /**
@@ -4354,10 +4692,8 @@ class Wallet
         if ($this->requiresRecovery()) {
             throw new CashuException(
                 'Wallet initialized with seed but without storage. ' .
-                'This is unsafe for token operations as counters will be lost. ' .
-                'Either: (1) Call restore() first to recover existing proofs and counters, ' .
-                'then reinitialize with storage, or (2) Initialize with storage: ' .
-                'new Wallet($mintUrl, $unit, $dbPath) then initFromMnemonic($seed).'
+                'The seed is not ready for spending. Complete restore() when recovering an ' .
+                'existing seed, or initialize a new seed with persistent storage.'
             );
         }
     }
@@ -4881,7 +5217,16 @@ class Wallet
                 // Store proofs and counters for this unit
                 if ($this->dbPath !== null) {
                     // Create storage for this unit (may be different from wallet's primary unit)
-                    $unitStorage = new WalletStorage($this->dbPath, $this->mintUrl, $unit);
+                    $unitStorage = new WalletStorage(
+                        $this->dbPath,
+                        $this->mintUrl,
+                        $unit,
+                        $this->storageIdentity
+                    );
+                    $fingerprint = $this->storage?->getSeedFingerprint();
+                    if ($fingerprint !== null && $unitStorage->getSeedFingerprint() === null) {
+                        $unitStorage->bindSeedFingerprint($fingerprint, true, false);
+                    }
 
                     // Store unspent proofs as UNSPENT
                     if (!empty($unspentProofs)) {
@@ -4909,6 +5254,21 @@ class Wallet
         // Update internal counters for this wallet's unit
         foreach ($finalCounters as $keysetId => $counter) {
             $this->counters[$keysetId] = $counter;
+        }
+        if ($this->storage) {
+            $this->storage->markSeedReady();
+            foreach (array_keys($byUnit) as $unit) {
+                $unitStorage = new WalletStorage(
+                    $this->dbPath,
+                    $this->mintUrl,
+                    $unit,
+                    $this->storageIdentity
+                );
+                if ($unitStorage->getSeedFingerprint() !== null) {
+                    $unitStorage->markSeedReady();
+                }
+            }
+            $this->seedReadyForSpending = true;
         }
 
         return [
