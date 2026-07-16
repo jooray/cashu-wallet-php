@@ -4357,10 +4357,16 @@ class Wallet
             }
         }
 
-        // NUT-02: verify announced keyset IDs against the keys. For V2 the ID
-        // also commits to unit, input_fee_ppk and final_expiry, so a mint
-        // cannot misreport fees without changing the ID.
+        // NUT-02: verify announced keyset IDs against the keys. Enforced only
+        // for V2 ("01") IDs, where the derivation is unambiguous and the ID
+        // commits to unit, input_fee_ppk and final_expiry (a mint cannot
+        // misreport fees without changing the ID). Many production mints carry
+        // V1 keysets created under older derivation rules whose IDs no longer
+        // re-derive — for those the ID is just a stable identifier.
         foreach ($this->keysets as $keyset) {
+            if (strtolower(substr($keyset->id, 0, 2)) !== '01') {
+                continue;
+            }
             $expected = $keyset->deriveExpectedId();
             if ($expected !== null && !hash_equals(strtolower($expected), strtolower($keyset->id))) {
                 throw new CashuException(
@@ -4391,11 +4397,14 @@ class Wallet
             foreach ($this->keysets as $keyset) {
                 if ($keyset->id === $keysetId) {
                     $keyset->keys = $keys;
-                    $expected = $keyset->deriveExpectedId();
-                    if ($expected !== null && !hash_equals(strtolower($expected), strtolower($keysetId))) {
-                        throw new CashuException(
-                            "Mint announced keyset ID {$keysetId} but its keys derive to {$expected}"
-                        );
+                    // Enforce ID verification only for V2 IDs (see loadMint()).
+                    if (strtolower(substr($keysetId, 0, 2)) === '01') {
+                        $expected = $keyset->deriveExpectedId();
+                        if ($expected !== null && !hash_equals(strtolower($expected), strtolower($keysetId))) {
+                            throw new CashuException(
+                                "Mint announced keyset ID {$keysetId} but its keys derive to {$expected}"
+                            );
+                        }
                     }
                 }
             }
