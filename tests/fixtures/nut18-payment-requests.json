@@ -1,0 +1,62 @@
+{
+    "_provenance": {
+        "source": "https://github.com/cashubtc/nuts/blob/master/tests/18-tests.md",
+        "commit": "0f1caff5d56bf0b315dded0cf0b88bbf0fd90676",
+        "note": "Encoded payment-request strings are official vectors. Expected fields below reflect the CBOR content of the encoded strings. For the 'basic' vector the upstream markdown JSON disagrees with its own encoded string (mint URL and nprofile differ); the encoded string is used as the source of truth."
+    },
+    "vectors": [
+        {
+            "name": "basic",
+            "encoded": "creqApWF0gaNhdGVub3N0cmFheKlucHJvZmlsZTFxeTI4d3VtbjhnaGo3dW45ZDNzaGp0bnl2OWtoMnVld2Q5aHN6OW1od2RlbjV0ZTB3ZmprY2N0ZTljdXJ4dmVuOWVlaHFjdHJ2NWhzenJ0aHdkZW41dGUwZGVoaHh0bnZkYWtxcWd5ZGFxeTdjdXJrNDM5eWtwdGt5c3Y3dWRoZGh1NjhzdWNtMjk1YWtxZWZkZWhrZjBkNDk1Y3d1bmw1YWeBgmFuYjE3YWloYjdhOTAxNzZhYQphdWNzYXRhbYF4Imh0dHBzOi8vbm9mZWVzLnRlc3RudXQuY2FzaHUuc3BhY2U=",
+            "id": "b7a90176",
+            "amount": 10,
+            "unit": "sat",
+            "mints": ["https://nofees.testnut.cashu.space"],
+            "transport": "nostr"
+        },
+        {
+            "name": "complete",
+            "encoded": "creqAqGF0gaNhdGRwb3N0YWF4G2h0dHBzOi8vYXBpLmV4YW1wbGUuY29tL3BheWFn92FpaDQ4NDBmNTFlYWEZA+hhdWNzYXRhbYF4GGh0dHBzOi8vbWludC5leGFtcGxlLmNvbWFkcFByb2R1Y3QgcHVyY2hhc2Vhc/VlbnV0MTCjYWtkUDJQS2FkeEIwM2JhZjBjM2FjMjIwMzY2YzJjMzk3YmY5MzA1NzljNDE2MzQzNTU4NGY1NzNiMTA5MTA5ODdjNTQ0YzU5ZTYxZjFhdIGCZ3B1cnBvc2Vnb2ZmbGluZQ==",
+            "id": "4840f51e",
+            "amount": 1000,
+            "unit": "sat",
+            "mints": ["https://mint.example.com"],
+            "transport": "post",
+            "memo": "Product purchase"
+        },
+        {
+            "name": "http-transport",
+            "encoded": "creqApWF0gaNhdGRwb3N0YWF4H2h0dHBzOi8vYXBpLmV4YW1wbGUuY29tL3JlY2VpdmVhZ/dhaWhhMmMxMmY0NWFhGDJhdWNzYXRhbYF4GWh0dHBzOi8vY2FzaHUuZXhhbXBsZS5jb20=",
+            "id": "a2c12f45",
+            "amount": 50,
+            "unit": "sat",
+            "mints": ["https://cashu.example.com"],
+            "transport": "post"
+        },
+        {
+            "name": "nostr-transport",
+            "encoded": "creqApWF0gaNhdGVub3N0cmFheD9ucHViMXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXEyOHNwajNhZ4KCYW5iMTeCYW5kOTczNWFpaGY5MmE1MWI4YWEYZGF1Y3NhdGFtgngZaHR0cHM6Ly9taW50MS5leGFtcGxlLmNvbXgZaHR0cHM6Ly9taW50Mi5leGFtcGxlLmNvbQ==",
+            "id": "f92a51b8",
+            "amount": 100,
+            "unit": "sat",
+            "mints": ["https://mint1.example.com", "https://mint2.example.com"],
+            "transport": "nostr"
+        },
+        {
+            "name": "minimal",
+            "encoded": "creqAo2FpaDdmNGEyYjM5YXVjc2F0YW2BeBhodHRwczovL21pbnQuZXhhbXBsZS5jb20=",
+            "id": "7f4a2b39",
+            "amount": 0,
+            "unit": "sat",
+            "mints": ["https://mint.example.com"]
+        },
+        {
+            "name": "nut10-locking",
+            "encoded": "creqApWFpaGM5ZTQ1ZDJhYWEZAfRhdWNzYXRhbYF4GGh0dHBzOi8vbWludC5leGFtcGxlLmNvbWVudXQxMKNha2RQMlBLYWR4QjAyYzNiNWJiMjdlMzYxNDU3YzkyZDkzZDc4ZGQ3M2QzZDUzNzMyMTEwYjJjZmU4YjUwZmJjMGFiYzYxNWU5YzMzMWF0gYJndGltZW91dGQzNjAw",
+            "id": "c9e45d2a",
+            "amount": 500,
+            "unit": "sat",
+            "mints": ["https://mint.example.com"]
+        }
+    ]
+}

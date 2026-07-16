@@ -1,0 +1,44 @@
+{
+    "_provenance": {
+        "source": "https://github.com/cashubtc/nuts/blob/master/tests/00-tests.md",
+        "commit": "0f1caff5d56bf0b315dded0cf0b88bbf0fd90676"
+    },
+    "hash_to_curve": [
+        {
+            "message": "0000000000000000000000000000000000000000000000000000000000000000",
+            "point": "024cce997d3b518f739663b757deaec95bcd9473c30a14ac2fd04023a739d1a725"
+        },
+        {
+            "message": "0000000000000000000000000000000000000000000000000000000000000001",
+            "point": "022e7158e11c9506f1aa4248bf531298daa7febd6194f003edcd9b93ade6253acf"
+        },
+        {
+            "message": "0000000000000000000000000000000000000000000000000000000000000002",
+            "point": "026cdbe15362df59cd1dd3c9c11de8aedac2106eca69236ecd9fbe117af897be4f"
+        }
+    ],
+    "blinded_messages": [
+        {
+            "x": "d341ee4871f1f889041e63cf0d3823c713eea6aff01e80f1719f08f9e5be98f6",
+            "r": "99fce58439fc37412ab3468b73db0569322588f62fb3a49182d67e23d877824a",
+            "B_": "033b1a9737a40cc3fd9b6af4b723632b76a67a36782596304612a6c2bfb5197e6d"
+        },
+        {
+            "x": "f1aaf16c2239746f369572c0784d9dd3d032d952c2d992175873fb58fae31a60",
+            "r": "f78476ea7cc9ade20f9e05e58a804cf19533f03ea805ece5fee88c8e2874ba50",
+            "B_": "029bdf2d716ee366eddf599ba252786c1033f47e230248a4612a5670ab931f1763"
+        }
+    ],
+    "blind_signatures": [
+        {
+            "mint_privkey": "0000000000000000000000000000000000000000000000000000000000000001",
+            "B_": "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
+            "C_": "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2"
+        },
+        {
+            "mint_privkey": "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
+            "B_": "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
+            "C_": "0398bc70ce8184d27ba89834d19f5199c84443c31131e48d3c1214db24247d005d"
+        }
+    ]
+}

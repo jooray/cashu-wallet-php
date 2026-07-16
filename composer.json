@@ -1,0 +1,32 @@
+{
+    "name": "cashu/cashu-wallet-php",
+    "description": "Single-file, zero-dependency PHP implementation of the Cashu protocol. Composer is used for dev tooling (tests) only; consumers should require CashuWallet.php directly.",
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.0",
+        "ext-curl": "*",
+        "ext-json": "*",
+        "ext-pdo": "*"
+    },
+    "suggest": {
+        "ext-gmp": "Preferred big-integer backend (much faster than bcmath)",
+        "ext-bcmath": "Fallback big-integer backend when GMP is unavailable"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^12"
+    },
+    "scripts": {
+        "test": [
+            "@test:unit",
+            "@test:legacy"
+        ],
+        "test:unit": "phpunit",
+        "test:legacy": "@php tests/storage_safety.php"
+    },
+    "scripts-descriptions": {
+        "test": "Run the full test suite (PHPUnit + legacy plain-PHP tests)",
+        "test:unit": "Run the PHPUnit suite only",
+        "test:legacy": "Run the original plain-PHP storage safety test"
+    }
+}

@@ -3,3 +3,9 @@ test-wallet.db-shm
 test-wallet.db-wal
 AUDIT.md
 .claude/
+# Composer is dev-only tooling (tests); the library itself stays zero-dependency.
+# composer.lock is ignored so contributors on any supported PHP get a compatible
+# PHPUnit — there are no runtime deps to pin.
+vendor/
+composer.lock
+.phpunit.cache/
