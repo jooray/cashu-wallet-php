@@ -32,6 +32,23 @@ class CashuException extends \Exception {}
  */
 class CashuProtocolException extends CashuException
 {
+    // Standardized mint error codes (nuts/error_codes.md). getCode() returns
+    // the mint-provided code, or 0 when the mint sent none.
+    public const PROOF_VERIFICATION_FAILED = 10001;
+    public const PROOFS_ALREADY_SPENT = 11001;
+    public const PROOFS_PENDING = 11002;
+    public const OUTPUTS_ALREADY_SIGNED = 11003;
+    public const TRANSACTION_UNBALANCED = 11005;
+    public const KEYSET_UNKNOWN = 12001;
+    public const KEYSET_INACTIVE = 12002;
+    public const KEYSET_EXPIRED = 12003;
+    public const QUOTE_NOT_PAID = 20001;
+    public const QUOTE_ALREADY_ISSUED = 20002;
+    public const QUOTE_PENDING = 20005;
+    public const QUOTE_EXPIRED = 20007;
+    public const MINT_SIGNATURE_INVALID = 20008;
+    public const MINT_PUBKEY_REQUIRED = 20009;
+
     public function __construct(string $message, ?int $code = null)
     {
         parent::__construct($message, $code ?? 0);
@@ -817,6 +834,124 @@ class Secp256k1
     public static function hexToScalar(string $hex): BigInt
     {
         return BigInt::fromHex($hex);
+    }
+
+    // ========================================================================
+    // BIP340 SCHNORR SIGNATURES (used by NUT-20)
+    // ========================================================================
+
+    /** BIP340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data). */
+    public static function taggedHash(string $tag, string $data): string
+    {
+        $tagHash = hash('sha256', $tag, true);
+        return hash('sha256', $tagHash . $tagHash . $data, true);
+    }
+
+    /**
+     * BIP340 Schnorr signature over a 32-byte message hash.
+     *
+     * Deterministic: uses all-zero auxiliary randomness, which is the BIP340
+     * reference behaviour for aux = 0x00…00 and safe for our use (the message
+     * already commits to a unique quote id and fresh blinded outputs).
+     *
+     * @param string $privkeyHex 32-byte private key (hex)
+     * @param string $msg32 32-byte message hash (raw bytes)
+     * @return string 64-byte signature (hex)
+     */
+    public static function schnorrSign(string $privkeyHex, string $msg32): string
+    {
+        self::init();
+        if (strlen($msg32) !== 32) {
+            throw new CashuException('BIP340 message must be 32 bytes');
+        }
+
+        $n = self::getOrder();
+        $G = self::getGenerator();
+
+        $d = BigInt::fromHex($privkeyHex)->mod($n);
+        if ($d->isZero()) {
+            throw new CashuException('Invalid private key');
+        }
+
+        $P = self::scalarMult($d, $G);
+        if ($P[1]->isOdd()) {
+            $d = $n->sub($d);
+        }
+        $dBytes = hex2bin(str_pad($d->toHex(), 64, '0', STR_PAD_LEFT));
+        $pxBytes = hex2bin($P[0]->toHex(64));
+
+        $aux = str_repeat("\x00", 32);
+        $t = $dBytes ^ self::taggedHash('BIP0340/aux', $aux);
+        $rand = self::taggedHash('BIP0340/nonce', $t . $pxBytes . $msg32);
+
+        $k = BigInt::fromHex(bin2hex($rand))->mod($n);
+        if ($k->isZero()) {
+            throw new CashuException('BIP340 nonce derivation failed');
+        }
+        $R = self::scalarMult($k, $G);
+        if ($R[1]->isOdd()) {
+            $k = $n->sub($k);
+        }
+        $rxBytes = hex2bin($R[0]->toHex(64));
+
+        $e = BigInt::fromHex(bin2hex(self::taggedHash('BIP0340/challenge', $rxBytes . $pxBytes . $msg32)))->mod($n);
+        $s = $k->add($e->mul($d))->mod($n);
+
+        $sig = bin2hex($rxBytes) . str_pad($s->toHex(), 64, '0', STR_PAD_LEFT);
+
+        if (!self::schnorrVerify(bin2hex($pxBytes), $msg32, $sig)) {
+            throw new CashuException('BIP340 signature self-check failed');
+        }
+        return $sig;
+    }
+
+    /**
+     * BIP340 Schnorr verification.
+     *
+     * @param string $pubkey x-only (64 hex) or compressed (66 hex) public key
+     * @param string $msg32 32-byte message hash (raw bytes)
+     * @param string $sigHex 64-byte signature (hex)
+     */
+    public static function schnorrVerify(string $pubkey, string $msg32, string $sigHex): bool
+    {
+        self::init();
+        if (strlen($msg32) !== 32 || strlen($sigHex) !== 128 || !ctype_xdigit($sigHex)) {
+            return false;
+        }
+        $pubkeyX = strlen($pubkey) === 66 ? substr($pubkey, 2) : $pubkey;
+        if (strlen($pubkeyX) !== 64 || !ctype_xdigit($pubkeyX)) {
+            return false;
+        }
+
+        try {
+            // lift_x: point with the given x and even y
+            $P = self::decompressPoint(hex2bin('02' . $pubkeyX));
+
+            $n = self::getOrder();
+            $p = self::getPrime();
+            $r = BigInt::fromHex(substr($sigHex, 0, 64));
+            $s = BigInt::fromHex(substr($sigHex, 64, 64));
+            if ($r->cmp($p) >= 0 || $s->cmp($n) >= 0) {
+                return false;
+            }
+
+            $e = BigInt::fromHex(bin2hex(self::taggedHash(
+                'BIP0340/challenge',
+                hex2bin(substr($sigHex, 0, 64)) . hex2bin($pubkeyX) . $msg32
+            )))->mod($n);
+
+            // R = s*G - e*P
+            $R = self::pointSub(
+                self::scalarMult($s, self::getGenerator()),
+                self::scalarMult($e, $P)
+            );
+            if ($R === null || $R[1]->isOdd()) {
+                return false;
+            }
+            return $R[0]->cmp($r) === 0;
+        } catch (\Throwable $error) {
+            return false;
+        }
     }
 }
 
@@ -1682,7 +1817,8 @@ class MintQuote
         public ?int $expiry = null,
         public ?string $unit = null,
         public ?int $amountPaid = null,
-        public ?int $amountIssued = null
+        public ?int $amountIssued = null,
+        public ?string $pubkey = null
     ) {}
 
     public static function fromArray(array $data): self
@@ -1695,7 +1831,8 @@ class MintQuote
             $data['expiry'] ?? null,
             $data['unit'] ?? null,
             isset($data['amount_paid']) ? (int)$data['amount_paid'] : null,
-            isset($data['amount_issued']) ? (int)$data['amount_issued'] : null
+            isset($data['amount_issued']) ? (int)$data['amount_issued'] : null,
+            $data['pubkey'] ?? null
         );
     }
 
@@ -2599,6 +2736,15 @@ class WalletStorage
                 created_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS cashu_mint_quotes (
+                wallet_id TEXT NOT NULL,
+                quote_id TEXT NOT NULL,
+                key_counter INTEGER NOT NULL,
+                pubkey TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(wallet_id, quote_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_proofs_wallet_state
                 ON cashu_proofs(wallet_id, state);
             CREATE INDEX IF NOT EXISTS idx_proofs_secret
@@ -3297,6 +3443,39 @@ class WalletStorage
         return $ops;
     }
 
+    // ========================================================================
+    // MINT QUOTE LOCKING KEYS (NUT-20)
+    // ========================================================================
+
+    /** Remember which deterministic locking-key counter a mint quote uses. */
+    public function storeMintQuoteKey(string $quoteId, int $counter, string $pubkey): void
+    {
+        $stmt = $this->pdo->prepare(
+            'INSERT OR REPLACE INTO cashu_mint_quotes (wallet_id, quote_id, key_counter, pubkey, created_at)
+             VALUES (?, ?, ?, ?, ?)'
+        );
+        $stmt->execute([$this->walletId, $quoteId, $counter, $pubkey, time()]);
+    }
+
+    /** @return ?array{key_counter: int, pubkey: string} */
+    public function getMintQuoteKey(string $quoteId): ?array
+    {
+        $stmt = $this->pdo->prepare(
+            'SELECT key_counter, pubkey FROM cashu_mint_quotes WHERE wallet_id = ? AND quote_id = ?'
+        );
+        $stmt->execute([$this->walletId, $quoteId]);
+        $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+        return $row ? ['key_counter' => (int)$row['key_counter'], 'pubkey' => $row['pubkey']] : null;
+    }
+
+    public function deleteMintQuoteKey(string $quoteId): void
+    {
+        $stmt = $this->pdo->prepare(
+            'DELETE FROM cashu_mint_quotes WHERE wallet_id = ? AND quote_id = ?'
+        );
+        $stmt->execute([$this->walletId, $quoteId]);
+    }
+
     /** Return secrets reserved by unresolved money-moving operations. */
     public function getReservedInputSecrets(): array
     {
@@ -3937,6 +4116,73 @@ class Wallet
     }
 
     /**
+     * NUT-02 keyset hygiene: swap unspent proofs off inactive or soon-expiring
+     * keysets onto the active keyset, so held balances survive keyset rotation
+     * and are never stranded past a keyset's final_expiry.
+     *
+     * Inputs reserved by in-flight melt/swap recovery are never touched.
+     *
+     * @param int $expiryWithinSeconds Rotate proofs whose keyset expires within
+     *                                 this window (default 30 days)
+     * @return array{checked:int, rotated:int, skipped_reserved:int, skipped_dust:int, errors:array}
+     */
+    public function rotateProofs(int $expiryWithinSeconds = 2592000, int $batchSize = 50): array
+    {
+        $result = ['checked' => 0, 'rotated' => 0, 'skipped_reserved' => 0, 'skipped_dust' => 0, 'errors' => []];
+        if (!$this->storage) {
+            return $result;
+        }
+
+        $activeId = $this->getActiveKeysetId();
+        $rotateFrom = [];
+        foreach ($this->keysets as $keyset) {
+            if ($keyset->id === $activeId) {
+                continue;
+            }
+            $expiring = $keyset->finalExpiry !== null
+                && $keyset->finalExpiry !== 0
+                && $keyset->finalExpiry < time() + $expiryWithinSeconds;
+            if (!$keyset->active || $expiring) {
+                $rotateFrom[$keyset->id] = true;
+            }
+        }
+        if (empty($rotateFrom)) {
+            return $result;
+        }
+
+        $reserved = array_flip($this->storage->getReservedInputSecrets());
+        $candidates = [];
+        foreach ($this->storage->getProofsAsObjects(ProofState::UNSPENT) as $proof) {
+            if (!isset($rotateFrom[$proof->id])) {
+                continue;
+            }
+            $result['checked']++;
+            if (isset($reserved[$proof->secret])) {
+                $result['skipped_reserved']++;
+                continue;
+            }
+            $candidates[] = $proof;
+        }
+
+        foreach (array_chunk($candidates, $batchSize) as $batch) {
+            try {
+                $fee = $this->calculateFee($batch);
+                $amount = self::sumProofs($batch) - $fee;
+                if ($amount <= 0) {
+                    $result['skipped_dust'] += count($batch);
+                    continue;
+                }
+                $this->swap($batch, self::splitAmount($amount));
+                $result['rotated'] += count($batch);
+            } catch (\Throwable $e) {
+                $result['errors'][] = $e->getMessage();
+            }
+        }
+
+        return $result;
+    }
+
+    /**
      * NUT-12: verify a DLEQ proof on a melt-change signature when present.
      * B_ is recomputed from the deterministic blinding data.
      */
@@ -3973,7 +4219,7 @@ class Wallet
             $blindingData[] = $blinded;
         }
 
-        $response = $this->client->post('swap', [
+        $response = $this->postWithNut19Replay('swap', [
             'inputs' => array_map(fn($proof) => $proof->toArray(), $proofs),
             'outputs' => $outputs,
         ]);
@@ -4237,12 +4483,129 @@ class Wallet
             throw new CashuException('Amount must be greater than 0');
         }
 
-        $response = $this->client->post('mint/quote/bolt11', [
+        $body = [
             'amount' => $amount,
             'unit' => $this->unit
-        ]);
+        ];
 
-        return MintQuote::fromArray($response);
+        // NUT-20: lock the quote to a deterministic pubkey so knowing the quote
+        // id alone is not enough to mint. Only when the mint supports it.
+        $quoteKey = null;
+        if ($this->storage && $this->bip32 && $this->mintSupportsNut20()) {
+            $counter = $this->storage->incrementCounter(self::NUT20_COUNTER_ID);
+            $quoteKey = $this->deriveQuoteLockingKey($counter);
+            $body['pubkey'] = $quoteKey['pubkey'];
+        }
+
+        $response = $this->client->post('mint/quote/bolt11', $body);
+        $quote = MintQuote::fromArray($response);
+
+        if ($quoteKey !== null) {
+            $this->storage->storeMintQuoteKey($quote->quote, $quoteKey['counter'], $quoteKey['pubkey']);
+        }
+
+        return $quote;
+    }
+
+    /** Sentinel counter id (not a keyset) for NUT-20 quote locking keys. */
+    private const NUT20_COUNTER_ID = '_nut20_quote_keys';
+
+    /**
+     * NUT-19: POST a money-moving request, retrying once with the
+     * byte-identical body on a network-level failure. Mints supporting cached
+     * responses return the original result for a replayed request, so a
+     * timed-out-but-processed request is recovered instead of left ambiguous.
+     * Protocol errors (4xx/5xx with a body) are never retried.
+     */
+    private function postWithNut19Replay(string $path, array $body, ?int $timeout = null): array
+    {
+        try {
+            return $this->client->post($path, $body, $timeout);
+        } catch (CashuProtocolException $e) {
+            throw $e;
+        } catch (CashuException $e) {
+            if (!isset($this->mintInfo['nuts']['19'])) {
+                throw $e;
+            }
+            return $this->client->post($path, $body, $timeout);
+        }
+    }
+
+    private function mintSupportsNut20(): bool
+    {
+        return (bool)($this->mintInfo['nuts']['20']['supported'] ?? false);
+    }
+
+    /**
+     * NUT-20 deterministic quote locking key: m/129373'/20'/0'/0'/{counter}
+     *
+     * @return array{counter: int, privkey: string, pubkey: string}
+     */
+    public function deriveQuoteLockingKey(int $counter): array
+    {
+        if ($this->bip32 === null) {
+            throw new CashuException('Wallet not initialized with seed');
+        }
+        if ($counter < 0) {
+            throw new CashuException('Counter must be non-negative');
+        }
+        $privkey = $this->bip32->derivePath("m/129373'/20'/0'/0'/{$counter}");
+        $pubkey = bin2hex(Secp256k1::compressPoint(
+            Secp256k1::scalarMult(BigInt::fromHex($privkey), Secp256k1::getGenerator())
+        ));
+        return ['counter' => $counter, 'privkey' => $privkey, 'pubkey' => $pubkey];
+    }
+
+    /**
+     * NUT-20 message aggregation:
+     * "Cashu_MintQuoteSig_v1" || len32(quote) || quote
+     *   || per output: len32(amount) || amount || len32(B_) || B_
+     * with amounts as canonical minimal big-endian bytes (0 => empty).
+     */
+    public static function buildMintQuoteSignatureMessage(string $quoteId, array $outputs): string
+    {
+        $msg = 'Cashu_MintQuoteSig_v1';
+        $msg .= pack('N', strlen($quoteId)) . $quoteId;
+        foreach ($outputs as $output) {
+            $amount = (int)$output['amount'];
+            $amountHex = dechex($amount);
+            $amountBytes = $amount === 0 ? '' : hex2bin(strlen($amountHex) % 2 ? '0' . $amountHex : $amountHex);
+            $B = hex2bin($output['B_']);
+            $msg .= pack('N', strlen($amountBytes)) . $amountBytes;
+            $msg .= pack('N', strlen($B)) . $B;
+        }
+        return $msg;
+    }
+
+    /** BIP340-sign a mint request for a NUT-20 locked quote. */
+    public function signMintQuoteRequest(string $privkey, string $quoteId, array $outputs): string
+    {
+        $msg = self::buildMintQuoteSignatureMessage($quoteId, $outputs);
+        return Secp256k1::schnorrSign($privkey, hash('sha256', $msg, true));
+    }
+
+    /**
+     * Find the locking key for a quote whose local record is missing (e.g.
+     * after a seed restore): scan deterministic counters for the quote pubkey.
+     */
+    public function recoverQuoteLockingKey(string $quotePubkey, int $scanLimit = 200): ?array
+    {
+        if ($this->bip32 === null) {
+            return null;
+        }
+        $known = $this->storage ? $this->storage->getCounter(self::NUT20_COUNTER_ID) : 0;
+        $max = max($known + 20, $scanLimit);
+        for ($counter = 0; $counter < $max; $counter++) {
+            $key = $this->deriveQuoteLockingKey($counter);
+            if (hash_equals(strtolower($quotePubkey), $key['pubkey'])) {
+                if ($this->storage && $known <= $counter) {
+                    // Never lower the counter; bump past the recovered index.
+                    $this->storage->setCounter(self::NUT20_COUNTER_ID, $counter + 1);
+                }
+                return $key;
+            }
+        }
+        return null;
     }
 
     /**
@@ -4306,10 +4669,39 @@ class Wallet
         }
 
         // Request signatures from mint
-        $response = $this->client->post('mint/bolt11', [
+        $request = [
             'quote' => $quoteId,
             'outputs' => $outputs
-        ]);
+        ];
+
+        // NUT-20: sign when this quote was locked to one of our keys.
+        $quoteKey = $this->storage?->getMintQuoteKey($quoteId);
+        if ($quoteKey !== null && $this->bip32 !== null) {
+            $key = $this->deriveQuoteLockingKey($quoteKey['key_counter']);
+            $request['signature'] = $this->signMintQuoteRequest($key['privkey'], $quoteId, $outputs);
+        }
+
+        try {
+            $response = $this->postWithNut19Replay('mint/bolt11', $request);
+        } catch (CashuProtocolException $e) {
+            // Locked quote without a local key record (e.g. after seed restore):
+            // recover the deterministic key by scanning counters and retry once.
+            $signatureError = in_array($e->getCode(), [
+                CashuProtocolException::MINT_SIGNATURE_INVALID,
+                CashuProtocolException::MINT_PUBKEY_REQUIRED,
+            ], true);
+            if (!$signatureError || isset($request['signature'])) {
+                throw $e;
+            }
+            $quotePubkey = $this->checkMintQuote($quoteId)->pubkey;
+            $key = $quotePubkey ? $this->recoverQuoteLockingKey($quotePubkey) : null;
+            if ($key === null) {
+                throw $e;
+            }
+            $this->storage?->storeMintQuoteKey($quoteId, $key['counter'], $key['pubkey']);
+            $request['signature'] = $this->signMintQuoteRequest($key['privkey'], $quoteId, $outputs);
+            $response = $this->postWithNut19Replay('mint/bolt11', $request);
+        }
 
         // Guard: the mint must return exactly one signature per output. A short/empty set
         // means an incomplete response — do NOT proceed to store proofs and delete the
@@ -4354,6 +4746,7 @@ class Wallet
         if ($this->storage) {
             $this->storage->storeProofs($proofs, $quoteId);
             $this->storage->deletePendingOperation($pendingId);
+            $this->storage->deleteMintQuoteKey($quoteId);
         }
 
         return $proofs;
@@ -4447,7 +4840,7 @@ class Wallet
         // Send melt request. Lightning settlement can take well over the default 30s, so
         // allow a longer timeout here specifically. On timeout the caller should re-check
         // the melt quote state rather than assume failure. See FABLE-CASHU-WALLET-PHP (F6).
-        $response = $this->client->post('melt/bolt11', [
+        $response = $this->postWithNut19Replay('melt/bolt11', [
             'quote' => $quoteId,
             'inputs' => array_map(fn($p) => $p->toArray(), $proofs),
             'outputs' => $outputs

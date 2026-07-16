@@ -1024,6 +1024,25 @@ DLEQ proofs when tokens carry them (see `Crypto::verifyDleq()`,
 `isIssued()`, and `mintableAmount()` — the deprecated `state` field is only a
 fallback.
 
+**NUT-20 (signature on mint quote):** when the mint advertises support,
+`requestMintQuote()` automatically locks each quote to a deterministic pubkey
+(path `m/129373'/20'/0'/0'/{counter}`, per-quote key records in
+`cashu_mint_quotes`) and `mint()` signs the request with BIP340
+(`Secp256k1::schnorrSign()`/`schnorrVerify()`). Quotes created before the
+upgrade (no pubkey) mint unsigned as before. After a seed restore, missing key
+records are recovered by scanning counters against the quote's pubkey
+(`Wallet::recoverQuoteLockingKey()`).
+
+**Keyset hygiene:** `Wallet::rotateProofs()` swaps unspent proofs off inactive
+or soon-expiring keysets (NUT-02 `final_expiry`) onto the active keyset,
+skipping inputs reserved by in-flight recovery.
+
+**NUT-19:** mint/swap/melt requests are retried once with a byte-identical
+body on network-level failures when the mint advertises cached responses.
+Standardized mint error codes are available as constants on
+`CashuProtocolException` (e.g. `PROOFS_ALREADY_SPENT`, `KEYSET_EXPIRED`,
+`MINT_SIGNATURE_INVALID`); `getCode()` carries the mint-provided code.
+
 ---
 
 ### Unit
