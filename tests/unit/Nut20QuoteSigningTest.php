@@ -119,6 +119,21 @@ final class Nut20QuoteSigningTest extends TestCase
         $this->assertSame("\x00\x00\x00\x02\x01\x00", substr($msg256, $prefixLen, 6));
     }
 
+    public function testLegacyMintQuoteSignatureMessage(): void
+    {
+        // Mints released before the May 2026 hardening (nutshell <= 0.20.x)
+        // verify sha256 over quote_id || B_ hex strings, no length prefixes.
+        $v = cashu_fixture('nut20-quote-signing')['mint_request'];
+        $legacy = Wallet::buildMintQuoteSignatureMessageLegacy($v['quote'], $v['outputs']);
+        $this->assertSame($v['quote'] . $v['outputs'][0]['B_'] . $v['outputs'][1]['B_'], $legacy);
+        $this->assertNotSame($v['msg_sha256'], hash('sha256', $legacy));
+
+        $wallet = new Wallet('https://example.com', 'sat');
+        $sig = $wallet->signMintQuoteRequestLegacy($v['secret_key'], $v['quote'], $v['outputs']);
+        $this->assertTrue(Secp256k1::schnorrVerify($v['pubkey'], hash('sha256', $legacy, true), $sig));
+        $this->assertNotSame($v['signature'], $sig);
+    }
+
     // ------------------------------------------------------------------
     // Quote key storage
     // ------------------------------------------------------------------

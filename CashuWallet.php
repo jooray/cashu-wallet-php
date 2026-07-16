@@ -4594,6 +4594,89 @@ class Wallet
     }
 
     /**
+     * Pre-hardening NUT-20 message (verified by mints released before the
+     * May 2026 spec change, e.g. nutshell <= 0.20.x): the UTF-8 quote id
+     * concatenated with the B_ hex strings, no length prefixes.
+     */
+    public static function buildMintQuoteSignatureMessageLegacy(string $quoteId, array $outputs): string
+    {
+        $msg = $quoteId;
+        foreach ($outputs as $output) {
+            $msg .= $output['B_'];
+        }
+        return $msg;
+    }
+
+    /** BIP340-sign a mint request using the legacy pre-hardening message. */
+    public function signMintQuoteRequestLegacy(string $privkey, string $quoteId, array $outputs): string
+    {
+        $msg = self::buildMintQuoteSignatureMessageLegacy($quoteId, $outputs);
+        return Secp256k1::schnorrSign($privkey, hash('sha256', $msg, true));
+    }
+
+    private static function isMintSignatureError(CashuProtocolException $e): bool
+    {
+        return in_array($e->getCode(), [
+            CashuProtocolException::MINT_SIGNATURE_INVALID,
+            CashuProtocolException::MINT_PUBKEY_REQUIRED,
+        ], true);
+    }
+
+    /**
+     * Submit a mint request, handling NUT-20 locked quotes: sign with the
+     * stored deterministic key, recover the key by counter scan when the
+     * local record is missing (seed restore), and fall back to the legacy
+     * pre-hardening signature message for older mints.
+     */
+    private function submitMintRequest(string $quoteId, array $outputs): array
+    {
+        $request = [
+            'quote' => $quoteId,
+            'outputs' => $outputs
+        ];
+
+        $key = null;
+        $record = $this->storage?->getMintQuoteKey($quoteId);
+        if ($record !== null && $this->bip32 !== null) {
+            $key = $this->deriveQuoteLockingKey($record['key_counter']);
+            $request['signature'] = $this->signMintQuoteRequest($key['privkey'], $quoteId, $outputs);
+        }
+
+        try {
+            return $this->postWithNut19Replay('mint/bolt11', $request);
+        } catch (CashuProtocolException $e) {
+            if (!self::isMintSignatureError($e)) {
+                throw $e;
+            }
+
+            if ($key === null) {
+                // Locked quote without a local key record (e.g. after seed
+                // restore): recover the deterministic key by counter scan.
+                $quotePubkey = $this->checkMintQuote($quoteId)->pubkey;
+                $key = $quotePubkey ? $this->recoverQuoteLockingKey($quotePubkey) : null;
+                if ($key === null) {
+                    throw $e;
+                }
+                $this->storage?->storeMintQuoteKey($quoteId, $key['counter'], $key['pubkey']);
+                $request['signature'] = $this->signMintQuoteRequest($key['privkey'], $quoteId, $outputs);
+                try {
+                    return $this->postWithNut19Replay('mint/bolt11', $request);
+                } catch (CashuProtocolException $retryError) {
+                    if (!self::isMintSignatureError($retryError)) {
+                        throw $retryError;
+                    }
+                }
+            }
+
+            // The mint rejected the current-format signature. Mints released
+            // before the NUT-20 message hardening (e.g. nutshell <= 0.20.x)
+            // verify the legacy message instead — retry once with it.
+            $request['signature'] = $this->signMintQuoteRequestLegacy($key['privkey'], $quoteId, $outputs);
+            return $this->postWithNut19Replay('mint/bolt11', $request);
+        }
+    }
+
+    /**
      * Find the locking key for a quote whose local record is missing (e.g.
      * after a seed restore): scan deterministic counters for the quote pubkey.
      */
@@ -4677,40 +4760,9 @@ class Wallet
             }
         }
 
-        // Request signatures from mint
-        $request = [
-            'quote' => $quoteId,
-            'outputs' => $outputs
-        ];
-
-        // NUT-20: sign when this quote was locked to one of our keys.
-        $quoteKey = $this->storage?->getMintQuoteKey($quoteId);
-        if ($quoteKey !== null && $this->bip32 !== null) {
-            $key = $this->deriveQuoteLockingKey($quoteKey['key_counter']);
-            $request['signature'] = $this->signMintQuoteRequest($key['privkey'], $quoteId, $outputs);
-        }
-
-        try {
-            $response = $this->postWithNut19Replay('mint/bolt11', $request);
-        } catch (CashuProtocolException $e) {
-            // Locked quote without a local key record (e.g. after seed restore):
-            // recover the deterministic key by scanning counters and retry once.
-            $signatureError = in_array($e->getCode(), [
-                CashuProtocolException::MINT_SIGNATURE_INVALID,
-                CashuProtocolException::MINT_PUBKEY_REQUIRED,
-            ], true);
-            if (!$signatureError || isset($request['signature'])) {
-                throw $e;
-            }
-            $quotePubkey = $this->checkMintQuote($quoteId)->pubkey;
-            $key = $quotePubkey ? $this->recoverQuoteLockingKey($quotePubkey) : null;
-            if ($key === null) {
-                throw $e;
-            }
-            $this->storage?->storeMintQuoteKey($quoteId, $key['counter'], $key['pubkey']);
-            $request['signature'] = $this->signMintQuoteRequest($key['privkey'], $quoteId, $outputs);
-            $response = $this->postWithNut19Replay('mint/bolt11', $request);
-        }
+        // Request signatures from mint (handles NUT-20 locked quotes,
+        // including key recovery and the legacy-message fallback).
+        $response = $this->submitMintRequest($quoteId, $outputs);
 
         // Guard: the mint must return exactly one signature per output. A short/empty set
         // means an incomplete response — do NOT proceed to store proofs and delete the
