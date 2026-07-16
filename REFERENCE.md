@@ -1037,9 +1037,12 @@ records are recovered by scanning counters against the quote's pubkey
 or soon-expiring keysets (NUT-02 `final_expiry`) onto the active keyset,
 skipping inputs reserved by in-flight recovery.
 
-**NUT-19:** mint/swap/melt requests are retried once with a byte-identical
+**NUT-19:** mint and swap requests are retried once with a byte-identical
 body on network-level failures when the mint advertises cached responses.
-Standardized mint error codes are available as constants on
+Melt requests are deliberately not blindly replayed: after an ambiguous error,
+the wallet queries the authoritative melt-quote state and finalizes PAID or
+PENDING results. This remains safe with mints that advertise NUT-19 but have no
+operational response cache. Standardized mint error codes are available as constants on
 `CashuProtocolException` (e.g. `PROOFS_ALREADY_SPENT`, `KEYSET_EXPIRED`,
 `MINT_SIGNATURE_INVALID`); `getCode()` carries the mint-provided code.
 

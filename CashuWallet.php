@@ -4898,14 +4898,39 @@ class Wallet
             $blindingData[] = ['secret' => $blinded['secret'], 'r' => $blinded['r'], 'amount' => $amt];
         }
 
-        // Send melt request. Lightning settlement can take well over the default 30s, so
-        // allow a longer timeout here specifically. On timeout the caller should re-check
-        // the melt quote state rather than assume failure. See FABLE-CASHU-WALLET-PHP (F6).
-        $response = $this->postWithNut19Replay('melt/bolt11', [
+        // Send the melt once. Unlike mint/swap, a Lightning melt can complete
+        // before its HTTP response reaches us, and some Nutshell deployments
+        // advertise NUT-19 without an operational response cache. Blindly
+        // replaying then tries to insert the same spent Y values again and may
+        // return a raw database uniqueness error even though payment succeeded.
+        // On any ambiguous/protocol failure, reconcile through the authoritative
+        // melt-quote state before deciding whether to surface the error.
+        $request = [
             'quote' => $quoteId,
             'inputs' => array_map(fn($p) => $p->toArray(), $proofs),
             'outputs' => $outputs
-        ], 120);
+        ];
+        try {
+            // Lightning settlement can take well over the default 30s.
+            $response = $this->client->post('melt/bolt11', $request, 120);
+        } catch (CashuException $meltError) {
+            try {
+                $reconciled = $this->checkMeltQuote($quoteId);
+                if ($reconciled->isPaid() || $reconciled->isPending()) {
+                    $response = [
+                        'state' => $reconciled->state,
+                        'payment_preimage' => $reconciled->paymentPreimage,
+                        'change' => $reconciled->change ?? [],
+                    ];
+                } else {
+                    throw $meltError;
+                }
+            } catch (CashuException $quoteError) {
+                // Preserve the original operation error when reconciliation
+                // itself fails or confirms the quote is not paid/pending.
+                throw $meltError;
+            }
+        }
 
         // Process change
         $changeProofs = [];
