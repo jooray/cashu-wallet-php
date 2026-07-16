@@ -969,16 +969,20 @@ public function isPending(): bool;  // state === 'PENDING'
 
 ### Keyset
 
-Keyset information from mint.
+Keyset information from mint. Both keyset ID versions are supported:
+V1 (`00` + 14 hex chars, deprecated) and V2 (`01` + 64 hex chars, NUT-02).
+Deterministic secrets (NUT-13) automatically use BIP32 derivation for V1
+keysets and the HMAC-SHA256 KDF for V2 keysets.
 
 ```php
 class Keyset
 {
-    public string $id;        // Keyset ID (hex)
-    public string $unit;      // Currency unit
-    public array $keys;       // amount => public key (hex)
-    public bool $active;      // Is active
-    public int $inputFeePpk;  // Input fee (parts per thousand)
+    public string $id;         // Keyset ID (hex, "00..." V1 or "01..." V2)
+    public string $unit;       // Currency unit
+    public array $keys;        // amount => public key (hex)
+    public bool $active;       // Is active
+    public int $inputFeePpk;   // Input fee (parts per thousand)
+    public ?int $finalExpiry;  // NUT-02 final expiry (unix epoch) or null
 }
 ```
 
@@ -990,12 +994,35 @@ public function __construct(
     string $unit,
     array $keys,
     bool $active = true,
-    int $inputFeePpk = 0
+    int $inputFeePpk = 0,
+    ?int $finalExpiry = null
 );
 
-// Derive keyset ID from public keys
+// Derive a V1 keyset ID from public keys (deprecated format)
 public static function deriveKeysetId(array $keys): string;
+
+// Derive a V2 keyset ID (NUT-02): commits to keys, unit, fee, and expiry
+public static function deriveKeysetIdV2(
+    array $keys,
+    string $unit,
+    ?int $inputFeePpk = null,
+    ?int $finalExpiry = null
+): string;
+
+// Derive the expected ID using the version encoded in $id
+// (null for unverifiable legacy base64 IDs)
+public function deriveExpectedId(): ?string;
 ```
+
+`loadMint()` verifies every announced keyset ID against its keys (NUT-02) and
+keeps fee metadata for **inactive** keysets too, so proofs from rotated-out
+keysets stay spendable with correct fees. `Wallet::receive()` resolves NUT-00
+short keyset IDs (8-byte prefix of a V2 ID) to full IDs, and verifies NUT-12
+DLEQ proofs when tokens carry them (see `Crypto::verifyDleq()`,
+`Crypto::verifyProofDleq()`). Mint quotes expose the NUT-04/NUT-23
+`amount_paid`/`amount_issued` accounting via `MintQuote::isPaid()`,
+`isIssued()`, and `mintableAmount()` — the deprecated `state` field is only a
+fallback.
 
 ---
 

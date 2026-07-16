@@ -68,6 +68,7 @@ try {
     assertTrue($data['counter_start'] === 0, 'Unexpected reserved counter start');
     assertTrue($accountA->getCounter('0011223344556677') === 1, 'Output counter was not reserved atomically');
     assertTrue($accountA->getProofsStatesBySecrets(['reserve-me'])['reserve-me'] === ProofState::PENDING, 'Input was not reserved');
+    assertTrue(in_array('reserve-me', $accountA->getReservedInputSecrets(), true), 'Reserved input was not discoverable');
     expectCashuException(
         fn() => $accountA->preparePendingSpend('swap:other', 'swap', [$input], '0011223344556677', [4]),
         'A reserved input could be reserved by another operation'

@@ -930,6 +930,94 @@ class Crypto
         $Y = self::hashToCurve($secret);
         return bin2hex(Secp256k1::compressPoint($Y));
     }
+
+    /**
+     * NUT-12 hash_e: SHA256 over the concatenated lowercase hex strings of the
+     * uncompressed (65-byte) serializations of the given points.
+     *
+     * @param array ...$points Points as [BigInt $x, BigInt $y]
+     * @return string 64-char hex digest
+     */
+    public static function hashE(array ...$points): string
+    {
+        $concat = '';
+        foreach ($points as $point) {
+            $concat .= '04' . $point[0]->toHex(64) . $point[1]->toHex(64);
+        }
+        return hash('sha256', $concat);
+    }
+
+    /**
+     * Verify a NUT-12 DLEQ proof: R1 = s*G - e*A, R2 = s*B' - e*C',
+     * check e == hash_e(R1, R2, A, C').
+     *
+     * @param string $e   challenge (hex scalar)
+     * @param string $s   response (hex scalar)
+     * @param string $A   mint public key for the amount (33-byte compressed hex)
+     * @param string $B_  blinded message (compressed hex)
+     * @param string $C_  blind signature (compressed hex)
+     */
+    public static function verifyDleq(string $e, string $s, string $A, string $B_, string $C_): bool
+    {
+        try {
+            $eScalar = BigInt::fromHex($e);
+            $sScalar = BigInt::fromHex($s);
+            $Apoint = Secp256k1::decompressPoint(hex2bin($A));
+            $Bpoint = Secp256k1::decompressPoint(hex2bin($B_));
+            $Cpoint = Secp256k1::decompressPoint(hex2bin($C_));
+
+            $G = Secp256k1::getGenerator();
+            $R1 = Secp256k1::pointSub(
+                Secp256k1::scalarMult($sScalar, $G),
+                Secp256k1::scalarMult($eScalar, $Apoint)
+            );
+            $R2 = Secp256k1::pointSub(
+                Secp256k1::scalarMult($sScalar, $Bpoint),
+                Secp256k1::scalarMult($eScalar, $Cpoint)
+            );
+            if ($R1 === null || $R2 === null) {
+                return false;
+            }
+
+            return hash_equals(self::hashE($R1, $R2, $Apoint, $Cpoint), strtolower($e));
+        } catch (\Throwable $error) {
+            return false;
+        }
+    }
+
+    /**
+     * Verify the DLEQ proof on a received Proof (NUT-12 "Carol" flow):
+     * reconstruct B' = Y + r*G and C' = C + r*A from the revealed blinding
+     * factor, then run the standard verification.
+     */
+    public static function verifyProofDleq(Proof $proof, string $A): bool
+    {
+        if ($proof->dleq === null || $proof->dleq->r === null || $proof->dleq->r === '') {
+            return false;
+        }
+        try {
+            $r = BigInt::fromHex($proof->dleq->r);
+            $Apoint = Secp256k1::decompressPoint(hex2bin($A));
+            $Cpoint = Secp256k1::decompressPoint(hex2bin($proof->C));
+            $G = Secp256k1::getGenerator();
+
+            $B_ = Secp256k1::pointAdd(self::hashToCurve($proof->secret), Secp256k1::scalarMult($r, $G));
+            $C_ = Secp256k1::pointAdd($Cpoint, Secp256k1::scalarMult($r, $Apoint));
+            if ($B_ === null || $C_ === null) {
+                return false;
+            }
+
+            return self::verifyDleq(
+                $proof->dleq->e,
+                $proof->dleq->s,
+                $A,
+                bin2hex(Secp256k1::compressPoint($B_)),
+                bin2hex(Secp256k1::compressPoint($C_))
+            );
+        } catch (\Throwable $error) {
+            return false;
+        }
+    }
 }
 
 // ============================================================================
@@ -1386,12 +1474,16 @@ class DLEQWallet
     public function __construct(
         public string $e,
         public string $s,
-        public string $r
+        public ?string $r = null
     ) {}
 
     public function toArray(): array
     {
-        return ['e' => $this->e, 's' => $this->s, 'r' => $this->r];
+        $data = ['e' => $this->e, 's' => $this->s];
+        if ($this->r !== null) {
+            $data['r'] = $this->r;
+        }
+        return $data;
     }
 
     public static function fromArray(array $data): self
@@ -1510,11 +1602,12 @@ class Keyset
         public string $unit,
         public array $keys, // amount => public key (hex)
         public bool $active = true,
-        public int $inputFeePpk = 0
+        public int $inputFeePpk = 0,
+        public ?int $finalExpiry = null
     ) {}
 
     /**
-     * Derive keyset ID from public keys
+     * Derive a V1 keyset ID from public keys (NUT-02, deprecated format)
      */
     public static function deriveKeysetId(array $keys): string
     {
@@ -1530,6 +1623,50 @@ class Keyset
         // ID = "00" + first 14 hex chars of SHA256
         return '00' . substr(hash('sha256', $concat), 0, 14);
     }
+
+    /**
+     * Derive a V2 keyset ID (NUT-02): version byte "01" + SHA256 over
+     * "amount:pubkey" pairs joined by commas, plus unit / fee / expiry tags.
+     */
+    public static function deriveKeysetIdV2(
+        array $keys,
+        string $unit,
+        ?int $inputFeePpk = null,
+        ?int $finalExpiry = null
+    ): string {
+        ksort($keys);
+
+        $pairs = [];
+        foreach ($keys as $amount => $pubkey) {
+            $pairs[] = $amount . ':' . strtolower($pubkey);
+        }
+        $preimage = implode(',', $pairs);
+        $preimage .= '|unit:' . strtolower($unit);
+        if ($inputFeePpk !== null && $inputFeePpk !== 0) {
+            $preimage .= '|input_fee_ppk:' . $inputFeePpk;
+        }
+        if ($finalExpiry !== null && $finalExpiry !== 0) {
+            $preimage .= '|final_expiry:' . $finalExpiry;
+        }
+
+        return '01' . hash('sha256', $preimage);
+    }
+
+    /**
+     * Derive the expected ID for this keyset using the version encoded in its
+     * announced ID. Returns null for legacy (base64) IDs that cannot be verified.
+     */
+    public function deriveExpectedId(): ?string
+    {
+        if (empty($this->keys) || !TokenSerializer::isHexKeysetId($this->id)) {
+            return null;
+        }
+        return match (substr($this->id, 0, 2)) {
+            '00' => self::deriveKeysetId($this->keys),
+            '01' => self::deriveKeysetIdV2($this->keys, $this->unit, $this->inputFeePpk, $this->finalExpiry),
+            default => null,
+        };
+    }
 }
 
 /**
@@ -1543,7 +1680,9 @@ class MintQuote
         public int $amount,
         public string $state,
         public ?int $expiry = null,
-        public ?string $unit = null
+        public ?string $unit = null,
+        public ?int $amountPaid = null,
+        public ?int $amountIssued = null
     ) {}
 
     public static function fromArray(array $data): self
@@ -1552,20 +1691,41 @@ class MintQuote
             $data['quote'],
             $data['request'],
             $data['amount'] ?? 0,
-            $data['state'] ?? 'UNPAID',
+            $data['state'] ?? '',
             $data['expiry'] ?? null,
-            $data['unit'] ?? null
+            $data['unit'] ?? null,
+            isset($data['amount_paid']) ? (int)$data['amount_paid'] : null,
+            isset($data['amount_issued']) ? (int)$data['amount_issued'] : null
         );
     }
 
+    /**
+     * NUT-04/NUT-23: `state` is deprecated; when the mint sends
+     * `amount_paid`/`amount_issued`, those are authoritative.
+     */
     public function isPaid(): bool
     {
+        if ($this->amountPaid !== null && $this->amountIssued !== null) {
+            return $this->amountPaid > $this->amountIssued;
+        }
         return strtoupper($this->state) === 'PAID';
     }
 
     public function isIssued(): bool
     {
+        if ($this->amountPaid !== null && $this->amountIssued !== null) {
+            return $this->amountIssued > 0 && $this->amountIssued >= $this->amountPaid;
+        }
         return strtoupper($this->state) === 'ISSUED';
+    }
+
+    /** Amount that has been paid but not yet issued (mintable now). */
+    public function mintableAmount(): ?int
+    {
+        if ($this->amountPaid === null || $this->amountIssued === null) {
+            return null;
+        }
+        return max(0, $this->amountPaid - $this->amountIssued);
     }
 }
 
@@ -2142,12 +2302,13 @@ class TokenSerializer
     }
 
     /**
-     * Check if keyset ID is in modern hex format (16 hex chars)
-     * V4 tokens only support this format; deprecated base64 IDs need V3 format
+     * Check if keyset ID is in modern hex format: 16 hex chars (V1, version
+     * byte "00") or 66 hex chars (V2, version byte "01", NUT-02).
+     * V4 tokens only support hex IDs; deprecated base64 IDs need V3 format.
      */
     public static function isHexKeysetId(string $id): bool
     {
-        return strlen($id) === 16 && ctype_xdigit($id);
+        return (strlen($id) === 16 || strlen($id) === 66) && ctype_xdigit($id);
     }
 
     /**
@@ -2815,6 +2976,45 @@ class WalletStorage
         }, $rows);
     }
 
+    /** @return Proof[] */
+    public function getProofsBySecretsAsObjects(array $secrets): array
+    {
+        if (empty($secrets)) {
+            return [];
+        }
+        $placeholders = implode(',', array_fill(0, count($secrets), '?'));
+        $stmt = $this->pdo->prepare(
+            "SELECT keyset_id, amount, secret, C, dleq FROM cashu_proofs
+             WHERE wallet_id = ? AND secret IN ($placeholders)"
+        );
+        $stmt->execute(array_merge([$this->walletId], $secrets));
+        $bySecret = [];
+        foreach ($stmt->fetchAll(\PDO::FETCH_ASSOC) as $row) {
+            $dleq = null;
+            if (!empty($row['dleq'])) {
+                $data = json_decode($row['dleq'], true);
+                if ($data) {
+                    $dleq = new DLEQWallet($data['e'], $data['s'], $data['r'] ?? null);
+                }
+            }
+            $bySecret[$row['secret']] = new Proof(
+                $row['keyset_id'],
+                (int)$row['amount'],
+                $row['secret'],
+                $row['C'],
+                $dleq
+            );
+        }
+        $proofs = [];
+        foreach ($secrets as $secret) {
+            if (!isset($bySecret[$secret])) {
+                throw new CashuException('Pending operation input proof is missing from storage');
+            }
+            $proofs[] = $bySecret[$secret];
+        }
+        return $proofs;
+    }
+
     // ========================================================================
     // COUNTER MANAGEMENT
     // ========================================================================
@@ -3097,6 +3297,20 @@ class WalletStorage
         return $ops;
     }
 
+    /** Return secrets reserved by unresolved money-moving operations. */
+    public function getReservedInputSecrets(): array
+    {
+        $reserved = [];
+        foreach (['melt', 'swap'] as $type) {
+            foreach ($this->getPendingOperations($type) as $operation) {
+                foreach (($operation['data']['input_secrets'] ?? []) as $secret) {
+                    $reserved[$secret] = true;
+                }
+            }
+        }
+        return array_keys($reserved);
+    }
+
     /**
      * Delete a pending operation
      *
@@ -3215,6 +3429,7 @@ class Wallet
     // Seed-based deterministic secret generation (NUT-13)
     private ?string $mnemonic = null;
     private ?BIP32 $bip32 = null;
+    private ?string $seedBytes = null; // raw BIP39 seed, needed for NUT-13 HMAC (V2 keyset) derivation
     private array $counters = []; // keyset_id => counter
 
     // SQLite storage
@@ -3602,12 +3817,22 @@ class Wallet
         // Unblind change signatures and store proofs
         $changeProofs = [];
 
+        if (count($quote->change) > count($blindingData)) {
+            throw new CashuException('Mint returned more melt change signatures than prepared outputs');
+        }
+
         foreach ($quote->change as $i => $sig) {
-            if (!isset($blindingData[$i])) {
-                continue;
+            // NUT-08: the mint ignores the amounts on the wallet's change outputs and
+            // assigns its own (the decomposed overpaid fees), so only the keyset and
+            // output count can be validated — not the amounts.
+            if (!isset($blindingData[$i])
+                || ($sig['id'] ?? null) !== $keysetId
+                || (int)($sig['amount'] ?? 0) <= 0) {
+                throw new CashuException('Mint returned melt change that does not match the prepared outputs');
             }
 
             $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
+            $this->verifyChangeSignatureDleq($sig, $blindingData[$i], $pubkey);
             $C = Crypto::unblindSignature($sig['C_'], $blindingData[$i]['r'], $pubkey);
 
             $proof = new Proof(
@@ -3658,9 +3883,9 @@ class Wallet
                     $this->storage->finalizePendingSpend($op['id'], $secrets, ProofState::SPENT, $proofs);
                     $result['recovered']++;
                 } elseif (!empty($states) && count(array_filter($states, fn($state) => $state === ProofState::UNSPENT)) === count($states)) {
-                    // A timed-out request may still be queued at the mint. Keep inputs
-                    // reserved instead of making them available to a competing spend.
-                    $result['still_pending']++;
+                    $proofs = $this->storage->getProofsBySecretsAsObjects($secrets);
+                    $this->submitPreparedSwap($op['id'], $proofs, $data);
+                    $result['recovered']++;
                 } else {
                     $result['still_pending']++;
                 }
@@ -3712,6 +3937,90 @@ class Wallet
     }
 
     /**
+     * NUT-12: verify a DLEQ proof on a melt-change signature when present.
+     * B_ is recomputed from the deterministic blinding data.
+     */
+    private function verifyChangeSignatureDleq(array $sig, array $blinding, string $pubkey): void
+    {
+        if (!isset($sig['dleq'])) {
+            return;
+        }
+        $Bpoint = Secp256k1::pointAdd(
+            Crypto::hashToCurve($blinding['secret']),
+            Secp256k1::scalarMult($blinding['r'], Secp256k1::getGenerator())
+        );
+        $B_ = bin2hex(Secp256k1::compressPoint($Bpoint));
+        if (!Crypto::verifyDleq($sig['dleq']['e'], $sig['dleq']['s'], $pubkey, $B_, $sig['C_'])) {
+            throw new CashuException('Mint returned an invalid DLEQ proof for melt change');
+        }
+    }
+
+    /** Submit an already journaled swap using its exact deterministic outputs. */
+    private function submitPreparedSwap(string $pendingId, array $proofs, array $pendingData): array
+    {
+        $outputs = [];
+        $blindingData = [];
+        foreach (($pendingData['amounts'] ?? []) as $i => $amount) {
+            $blinded = $this->createDeterministicBlindedMessage(
+                $pendingData['keyset_id'],
+                $pendingData['counter_start'] + $i
+            );
+            $outputs[] = [
+                'amount' => $amount,
+                'id' => $pendingData['keyset_id'],
+                'B_' => $blinded['B_'],
+            ];
+            $blindingData[] = $blinded;
+        }
+
+        $response = $this->client->post('swap', [
+            'inputs' => array_map(fn($proof) => $proof->toArray(), $proofs),
+            'outputs' => $outputs,
+        ]);
+        $signatures = $response['signatures'] ?? [];
+        if (count($signatures) !== count($outputs)) {
+            throw new CashuException('Mint returned an incomplete swap response; recovery journal retained');
+        }
+
+        $newProofs = [];
+        foreach ($signatures as $i => $signature) {
+            if (($signature['id'] ?? null) !== $pendingData['keyset_id']
+                || (int)($signature['amount'] ?? -1) !== (int)$pendingData['amounts'][$i]) {
+                throw new CashuException('Mint returned swap signatures that do not match prepared outputs');
+            }
+            $pubkey = $this->getPublicKey($signature['id'], $signature['amount']);
+
+            $dleq = null;
+            if (isset($signature['dleq'])) {
+                // NUT-12: when the mint includes a DLEQ proof, wallets MUST verify it.
+                if (!Crypto::verifyDleq($signature['dleq']['e'], $signature['dleq']['s'], $pubkey, $outputs[$i]['B_'], $signature['C_'])) {
+                    throw new CashuException('Mint returned an invalid DLEQ proof for a swapped signature');
+                }
+                $dleq = new DLEQWallet(
+                    $signature['dleq']['e'],
+                    $signature['dleq']['s'],
+                    Secp256k1::scalarToHex($blindingData[$i]['r'])
+                );
+            }
+
+            $newProofs[] = new Proof(
+                $signature['id'],
+                $signature['amount'],
+                $blindingData[$i]['secret'],
+                Crypto::unblindSignature($signature['C_'], $blindingData[$i]['r'], $pubkey),
+                $dleq
+            );
+        }
+        $this->storage->finalizePendingSpend(
+            $pendingId,
+            $pendingData['input_secrets'],
+            ProofState::SPENT,
+            $newProofs
+        );
+        return $newProofs;
+    }
+
+    /**
      * Parse a display amount string to smallest unit
      *
      * @param string $input User input (e.g., "0.05" for 5 cents in EUR)
@@ -3739,16 +4048,26 @@ class Wallet
         $keysetsResponse = $this->client->get('keysets');
         $this->keysets = [];
 
+        // Keep ALL keysets for the unit: inactive keysets still owe their
+        // input_fee_ppk when their proofs are spent (NUT-02), so fee metadata
+        // must survive rotations. Active keysets sort first so that
+        // getActiveKeysetId() keeps returning a keyset usable for outputs.
         foreach ($keysetsResponse['keysets'] ?? [] as $ks) {
-            if (($ks['unit'] ?? 'sat') === $this->unit && ($ks['active'] ?? true)) {
+            if (($ks['unit'] ?? 'sat') === $this->unit) {
                 $this->keysets[] = new Keyset(
                     $ks['id'],
                     $ks['unit'] ?? 'sat',
                     [],
                     $ks['active'] ?? true,
-                    $ks['input_fee_ppk'] ?? 0
+                    $ks['input_fee_ppk'] ?? 0,
+                    $ks['final_expiry'] ?? null
                 );
             }
+        }
+        usort($this->keysets, fn(Keyset $a, Keyset $b) => (int)$b->active <=> (int)$a->active);
+
+        if (empty(array_filter($this->keysets, fn(Keyset $k) => $k->active))) {
+            $this->keysets = [];
         }
 
         if (empty($this->keysets)) {
@@ -3791,6 +4110,53 @@ class Wallet
                 }
             }
         }
+
+        // NUT-02: verify announced keyset IDs against the keys. For V2 the ID
+        // also commits to unit, input_fee_ppk and final_expiry, so a mint
+        // cannot misreport fees without changing the ID.
+        foreach ($this->keysets as $keyset) {
+            $expected = $keyset->deriveExpectedId();
+            if ($expected !== null && !hash_equals(strtolower($expected), strtolower($keyset->id))) {
+                throw new CashuException(
+                    "Mint announced keyset ID {$keyset->id} but its keys derive to {$expected}"
+                );
+            }
+        }
+    }
+
+    /**
+     * Ensure keys for a (possibly inactive/rotated) keyset are loaded.
+     * Fetches GET /keys/{id} on demand and verifies the ID (NUT-02).
+     */
+    private function ensureKeysetKeys(string $keysetId): void
+    {
+        if (isset($this->keys[$keysetId])) {
+            return;
+        }
+        $response = $this->client->get('keys/' . urlencode($keysetId));
+        foreach ($response['keysets'] ?? [] as $ks) {
+            if (($ks['id'] ?? null) !== $keysetId) {
+                continue;
+            }
+            $keys = [];
+            foreach ($ks['keys'] ?? [] as $amount => $pubkey) {
+                $keys[(int)$amount] = $pubkey;
+            }
+            foreach ($this->keysets as $keyset) {
+                if ($keyset->id === $keysetId) {
+                    $keyset->keys = $keys;
+                    $expected = $keyset->deriveExpectedId();
+                    if ($expected !== null && !hash_equals(strtolower($expected), strtolower($keysetId))) {
+                        throw new CashuException(
+                            "Mint announced keyset ID {$keysetId} but its keys derive to {$expected}"
+                        );
+                    }
+                }
+            }
+            $this->keys[$keysetId] = $keys;
+            return;
+        }
+        throw new CashuException("Mint has no keys for keyset $keysetId");
     }
 
     /**
@@ -3798,17 +4164,23 @@ class Wallet
      */
     public function getActiveKeysetId(): string
     {
-        if (empty($this->keysets)) {
-            throw new CashuException('Mint not loaded. Call loadMint() first.');
+        foreach ($this->keysets as $keyset) {
+            if ($keyset->active) {
+                return $keyset->id;
+            }
         }
-        return $this->keysets[0]->id;
+        throw new CashuException('Mint not loaded. Call loadMint() first.');
     }
 
     /**
-     * Get public key for amount
+     * Get public key for amount. Lazily fetches keys for keysets that are no
+     * longer in the active /keys response (e.g. after a keyset rotation).
      */
     public function getPublicKey(string $keysetId, int $amount): string
     {
+        if (!isset($this->keys[$keysetId][$amount])) {
+            $this->ensureKeysetKeys($keysetId);
+        }
         if (!isset($this->keys[$keysetId][$amount])) {
             throw new CashuException("No public key for amount $amount in keyset $keysetId");
         }
@@ -3958,6 +4330,10 @@ class Wallet
 
             $dleq = null;
             if (isset($sig['dleq'])) {
+                // NUT-12: when the mint includes a DLEQ proof, wallets MUST verify it.
+                if (!Crypto::verifyDleq($sig['dleq']['e'], $sig['dleq']['s'], $pubkey, $outputs[$i]['B_'], $sig['C_'])) {
+                    throw new CashuException('Mint returned an invalid DLEQ proof for a minted signature');
+                }
                 $dleq = new DLEQWallet(
                     $sig['dleq']['e'],
                     $sig['dleq']['s'],
@@ -4084,12 +4460,16 @@ class Wallet
             throw new CashuException('Mint returned more melt change signatures than prepared outputs');
         }
         foreach ($changeSignatures as $i => $sig) {
+            // NUT-08: the mint ignores the amounts on the wallet's change outputs and
+            // assigns its own (the decomposed overpaid fees), so only the keyset and
+            // output count can be validated — not the amounts.
             if (!isset($blindingData[$i])
                 || ($sig['id'] ?? null) !== $keysetId
-                || (int)($sig['amount'] ?? -1) !== (int)$blindingData[$i]['amount']) {
+                || (int)($sig['amount'] ?? 0) <= 0) {
                 throw new CashuException('Mint returned melt change that does not match the prepared outputs');
             }
             $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
+            $this->verifyChangeSignatureDleq($sig, $blindingData[$i], $pubkey);
             $C = Crypto::unblindSignature($sig['C_'], $blindingData[$i]['r'], $pubkey);
 
             $changeProofs[] = new Proof(
@@ -4171,62 +4551,7 @@ class Wallet
             throw new CashuException('Pending swap outputs do not match requested amounts');
         }
 
-        $outputs = [];
-        $blindingData = [];
-
-        $keysetId = $pendingData['keyset_id'];
-        $counterStart = $pendingData['counter_start'];
-        foreach ($pendingData['amounts'] as $i => $amt) {
-            $counter = $counterStart + $i;
-            $blinded = $this->createDeterministicBlindedMessage($keysetId, $counter);
-            $secret = $blinded['secret'];
-
-            $outputs[] = [
-                'amount' => $amt,
-                'id' => $keysetId,
-                'B_' => $blinded['B_']
-            ];
-
-            $blindingData[] = [
-                'secret' => $secret,
-                'r' => $blinded['r'],
-                'amount' => $amt
-            ];
-        }
-
-        // Send swap request
-        $response = $this->client->post('swap', [
-            'inputs' => array_map(fn($p) => $p->toArray(), $proofs),
-            'outputs' => $outputs
-        ]);
-
-        $signatures = $response['signatures'] ?? [];
-        if (count($signatures) !== count($outputs)) {
-            throw new CashuException('Mint returned an incomplete swap response; recovery journal retained');
-        }
-
-        // Unblind signatures
-        $newProofs = [];
-        foreach ($signatures as $i => $sig) {
-            $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
-            $C = Crypto::unblindSignature($sig['C_'], $blindingData[$i]['r'], $pubkey);
-
-            $newProofs[] = new Proof(
-                $sig['id'],
-                $sig['amount'],
-                $blindingData[$i]['secret'],
-                $C
-            );
-        }
-
-        $this->storage->finalizePendingSpend(
-            $pendingId,
-            $inputSecrets,
-            ProofState::SPENT,
-            $newProofs
-        );
-
-        return $newProofs;
+        return $this->submitPreparedSwap($pendingId, $proofs, $pendingData);
     }
 
     /**
@@ -4315,6 +4640,36 @@ class Wallet
     }
 
     /**
+     * Resolve NUT-00 short keyset IDs (first 8 bytes of a V2 ID, allowed in V4
+     * tokens) to the full 33-byte IDs known from this mint. Wallets MUST
+     * support both representations and MUST fail on ambiguity.
+     */
+    public function resolveShortKeysetIds(array $proofs): void
+    {
+        foreach ($proofs as $proof) {
+            $id = strtolower($proof->id);
+            // Full V1 (00..., 16 hex), full V2 (66 hex) and legacy base64 IDs pass through.
+            if (strlen($id) !== 16 || !ctype_xdigit($id) || str_starts_with($id, '00')) {
+                continue;
+            }
+            $matches = [];
+            foreach ($this->keysets as $keyset) {
+                if (str_starts_with(strtolower($keyset->id), $id)) {
+                    $matches[strtolower($keyset->id)] = true;
+                }
+            }
+            $matches = array_keys($matches);
+            if (count($matches) === 1) {
+                $proof->id = $matches[0];
+            } elseif (count($matches) > 1) {
+                throw new CashuException("Short keyset ID {$proof->id} is ambiguous on this mint");
+            } else {
+                throw new CashuException("Short keyset ID {$proof->id} does not match any keyset on this mint");
+            }
+        }
+    }
+
+    /**
      * Deserialize a token string
      */
     public function deserializeToken(string $tokenString): Token
@@ -4334,6 +4689,19 @@ class Wallet
         // Verify token is from this mint
         if (rtrim($token->mint, '/') !== $this->mintUrl) {
             throw new CashuException('Token is from a different mint');
+        }
+
+        $this->resolveShortKeysetIds($token->proofs);
+
+        // NUT-12: if a received proof carries a full DLEQ (with blinding factor),
+        // wallets MUST verify it — it proves the mint actually signed this proof.
+        foreach ($token->proofs as $proof) {
+            if ($proof->dleq !== null && $proof->dleq->r !== null && $proof->dleq->r !== '') {
+                $A = $this->getPublicKey($proof->id, $proof->amount);
+                if (!Crypto::verifyProofDleq($proof, $A)) {
+                    throw new CashuException('Received token contains an invalid DLEQ proof');
+                }
+            }
         }
 
         // Calculate fee and output amount
@@ -4373,6 +4741,13 @@ class Wallet
         // Verify token is from this mint
         if (rtrim($token->mint, '/') !== $this->mintUrl) {
             throw new CashuException('Token is from a different mint');
+        }
+
+        // Best-effort short-ID resolution: this path must keep working when the
+        // mint is unreachable (no keysets loaded), so unresolved short IDs are
+        // stored as-is and get resolved by the eventual online swap.
+        if (!empty($this->keysets)) {
+            $this->resolveShortKeysetIds($token->proofs);
         }
 
         // Store proofs directly without swap
@@ -4587,6 +4962,7 @@ class Wallet
 
         $this->mnemonic = $mnemonic;
         $this->bip32 = BIP32::fromSeed($seed);
+        $this->seedBytes = $seed;
         $this->seedReadyForSpending = $this->storage?->isSeedReady() ?? false;
 
         // Load counters from storage if available
@@ -4739,15 +5115,19 @@ class Wallet
      */
     public function keysetIdToInt(string $keysetId): int
     {
-        if (TokenSerializer::isHexKeysetId($keysetId)) {
-            // Modern hex format (version 1, 16 hex chars) - decode from hex
+        if (strlen($keysetId) === 16 && ctype_xdigit($keysetId)) {
+            // V1 hex format (version byte "00", 16 hex chars) - decode from hex
             $decoded = hex2bin($keysetId);
+        } elseif (strlen($keysetId) === 12 && base64_decode($keysetId, true) !== false) {
+            // Deprecated pre-V1 base64 format (12 chars) - decode from base64
+            $decoded = base64_decode($keysetId, true);
         } else {
-            // Deprecated base64 format - decode from base64
-            $decoded = base64_decode($keysetId);
-            if ($decoded === false) {
-                throw new CashuException("Invalid keyset ID: $keysetId");
-            }
+            // V2 ("01"...) and unknown formats must NEVER reach the BIP32 path:
+            // hex chars are valid base64, so a lenient base64_decode would
+            // silently produce garbage derivation instead of an error.
+            throw new CashuException(
+                "Keyset ID '$keysetId' has no BIP32 integer representation (NUT-13 legacy derivation is for V1 keysets only)"
+            );
         }
 
         // Convert bytes to hex, then to BigInt
@@ -4760,11 +5140,15 @@ class Wallet
     }
 
     /**
-     * Generate deterministic secret and blinding factor for a keyset/counter
+     * Generate deterministic secret and blinding factor for a keyset/counter (NUT-13)
      *
-     * Derivation path (NUT-13):
-     * m/129372'/0'/{keyset_id}'/{counter}'/0 → secret
-     * m/129372'/0'/{keyset_id}'/{counter}'/1 → blinding factor (r)
+     * V2 keysets (ID version byte "01"): HMAC-SHA256 KDF —
+     *   message = "Cashu_KDF_HMAC_SHA256" || keyset_id_bytes || counter_u64_be
+     *   secret = hex(HMAC(seed, message || 0x00)); r = HMAC(seed, message || 0x01) mod N
+     *
+     * V1 keysets (version byte "00", deprecated) and pre-V1 base64 IDs: BIP32 —
+     *   m/129372'/0'/{keyset_id_int}'/{counter}'/0 → secret
+     *   m/129372'/0'/{keyset_id_int}'/{counter}'/1 → blinding factor (r)
      *
      * @return array ['secret' => hex, 'r' => BigInt]
      */
@@ -4772,6 +5156,13 @@ class Wallet
     {
         if ($this->bip32 === null) {
             throw new CashuException('Wallet not initialized with seed');
+        }
+
+        if (strlen($keysetId) === 66 && ctype_xdigit($keysetId)) {
+            if (strtolower(substr($keysetId, 0, 2)) !== '01') {
+                throw new CashuException("Unsupported keyset ID version: $keysetId");
+            }
+            return $this->generateDeterministicSecretHmac($keysetId, $counter);
         }
 
         $keysetInt = $this->keysetIdToInt($keysetId);
@@ -4790,6 +5181,34 @@ class Wallet
         $r = $r->mod($n);
 
         return ['secret' => $secret, 'r' => $r];
+    }
+
+    /**
+     * NUT-13 HMAC-SHA256 KDF for V2 ("01") keysets.
+     *
+     * @return array ['secret' => hex, 'r' => BigInt]
+     */
+    private function generateDeterministicSecretHmac(string $keysetId, int $counter): array
+    {
+        if ($this->seedBytes === null) {
+            throw new CashuException('Wallet not initialized with seed');
+        }
+        if ($counter < 0) {
+            throw new CashuException('Counter must be non-negative');
+        }
+
+        $message = 'Cashu_KDF_HMAC_SHA256' . hex2bin($keysetId) . pack('J', $counter);
+
+        $secretDigest = hash_hmac('sha256', $message . "\x00", $this->seedBytes, true);
+        $rDigest = hash_hmac('sha256', $message . "\x01", $this->seedBytes, true);
+
+        $r = BigInt::fromHex(bin2hex($rDigest))->mod(Secp256k1::getOrder());
+        if ($r->toDec() === '0') {
+            // Astronomically unlikely; spec says reject rather than use r = 0.
+            throw new CashuException('Derived invalid blinding scalar r == 0');
+        }
+
+        return ['secret' => bin2hex($secretDigest), 'r' => $r];
     }
 
     /**
