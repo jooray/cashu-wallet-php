@@ -355,6 +355,81 @@ final class WalletStorageTest extends TestCase
 
     // ------------------------------------------------------------- metadata
 
+    public function testDuplicateImportsNeverResetPendingSpentOrExportedStates(): void
+    {
+        $storage = $this->storage();
+        foreach ([ProofState::PENDING, ProofState::SPENT, 'EXPORTED'] as $state) {
+            $proof = self::proof(2, $state);
+            $storage->storeProofs([$proof], 'original');
+            $storage->updateProofsState([$proof->secret], $state);
+            $storage->storeProofs([$proof], 'duplicate');
+            $this->assertSame($state, $storage->getProofsStatesBySecrets([$state])[$state]);
+        }
+        $this->assertSame(0, $storage->getBalance());
+        $this->assertCount(3, $storage->getProofsByQuoteId('original'));
+    }
+
+    public function testConflictingImportRollsBackWholeBatch(): void
+    {
+        $storage = $this->storage();
+        $storage->storeProofs([self::proof(2, 'existing')]);
+        try {
+            $storage->storeProofs([self::proof(1, 'new'), self::proof(4, 'existing')]);
+            $this->fail('Conflicting import accepted');
+        } catch (CashuException $e) {
+            $this->assertSame(2, $storage->getBalance());
+            $this->assertSame([], $storage->getProofsStatesBySecrets(['new']));
+        }
+    }
+
+    public function testStaleFinalizationCannotResurrectNextOperationsOutput(): void
+    {
+        $storage = $this->storage();
+        $input = self::proof(4, 'input');
+        $output = self::proof(4, 'output');
+        $storage->preparePendingSpend('swap:first', 'swap', [$input], self::KEYSET, [4]);
+        $storage->finalizePendingSpend('swap:first', ['input'], ProofState::SPENT, [$output]);
+        $storage->preparePendingSpend('swap:next', 'swap', [$output], self::KEYSET, [4]);
+        $storage->finalizePendingSpend('swap:first', ['input'], ProofState::SPENT, [$output]);
+        $this->assertSame(ProofState::PENDING, $storage->getProofsStatesBySecrets(['output'])['output']);
+        $this->assertNotNull($storage->getPendingOperationById('swap:next'));
+        $this->assertSame(0, $storage->getBalance());
+    }
+
+    public function testFinalizationRejectsWrongInputsAndLostReservation(): void
+    {
+        $storage = $this->storage();
+        $storage->preparePendingSpend('swap:q', 'swap', [self::proof(4, 'input')], self::KEYSET, [4]);
+        foreach ([['other'], ['input']] as $secrets) {
+            if ($secrets === ['input']) {
+                $storage->updateProofsState($secrets, ProofState::SPENT);
+            }
+            try {
+                $storage->finalizePendingSpend('swap:q', $secrets, ProofState::SPENT, [self::proof(4, 'out')]);
+                $this->fail('Invalid owner accepted');
+            } catch (CashuException $e) {
+                $this->assertNotNull($storage->getPendingOperationById('swap:q'));
+                $this->assertSame([], $storage->getProofsStatesBySecrets(['out']));
+            }
+        }
+    }
+
+    public function testConflictingFinalizationRollsBackOutputsAndRetainsJournal(): void
+    {
+        $storage = $this->storage();
+        $storage->storeProofs([self::proof(2, 'existing')]);
+        $storage->preparePendingSpend('swap:q', 'swap', [self::proof(4, 'input')], self::KEYSET, [2, 2]);
+        try {
+            $storage->finalizePendingSpend('swap:q', ['input'], ProofState::SPENT,
+                [self::proof(2, 'new'), self::proof(4, 'existing')]);
+            $this->fail('Conflicting output accepted');
+        } catch (CashuException $e) {
+            $this->assertSame(ProofState::PENDING, $storage->getProofsStatesBySecrets(['input'])['input']);
+            $this->assertNotNull($storage->getPendingOperationById('swap:q'));
+            $this->assertSame([], $storage->getProofsStatesBySecrets(['new']));
+        }
+    }
+
     public function testSeedFingerprintBinding(): void
     {
         $storage = $this->storage();

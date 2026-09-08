@@ -2918,10 +2918,14 @@ class WalletStorage
         }
 
         $stmt = $this->pdo->prepare("
-            INSERT OR REPLACE INTO cashu_proofs
+            INSERT INTO cashu_proofs
             (wallet_id, keyset_id, amount, secret, C, dleq, state, mint_quote_id, created_at)
             VALUES (?, ?, ?, ?, ?, ?, 'UNSPENT', ?, ?)
+            ON CONFLICT(wallet_id, secret) DO NOTHING
         ");
+        $existing = $this->pdo->prepare(
+            'SELECT keyset_id, amount, C FROM cashu_proofs WHERE wallet_id = ? AND secret = ?'
+        );
 
         // Store all proofs atomically: either every proof of a mint/swap/melt-change is
         // persisted, or none is. A crash mid-loop must not leave a partial set (which would
@@ -2953,12 +2957,18 @@ class WalletStorage
                     $quoteId,
                     $now
                 ]);
+                $existing->execute([$this->walletId, $proof->secret]);
+                $row = $existing->fetch(\PDO::FETCH_ASSOC);
+                if ($row['keyset_id'] !== $proof->id || (int)$row['amount'] !== $proof->amount
+                    || $row['C'] !== $proof->C) {
+                    throw new CashuException('Conflicting proof data for an existing secret');
+                }
             }
 
             if ($ownTransaction) {
                 $this->pdo->commit();
             }
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             if ($ownTransaction && $this->pdo->inTransaction()) {
                 $this->pdo->rollBack();
             }
@@ -3281,7 +3291,7 @@ class WalletStorage
             }
 
             $select = $this->pdo->prepare(
-                'SELECT state FROM cashu_proofs WHERE wallet_id = ? AND secret = ?'
+                'SELECT state, keyset_id, amount, C FROM cashu_proofs WHERE wallet_id = ? AND secret = ?'
             );
             $update = $this->pdo->prepare(
                 'UPDATE cashu_proofs SET state = ?, spent_at = NULL WHERE wallet_id = ? AND secret = ?'
@@ -3290,7 +3300,12 @@ class WalletStorage
 
             foreach ($proofs as $proof) {
                 $select->execute([$this->walletId, $proof->secret]);
-                $state = $select->fetchColumn();
+                $row = $select->fetch(\PDO::FETCH_ASSOC);
+                $state = $row === false ? false : $row['state'];
+                if ($row !== false && ($row['keyset_id'] !== $proof->id
+                    || (int)$row['amount'] !== $proof->amount || $row['C'] !== $proof->C)) {
+                    throw new CashuException('Conflicting proof data for an existing secret');
+                }
                 if ($state !== false && $state !== ProofState::UNSPENT) {
                     throw new CashuException("Cannot reserve proof: state is $state");
                 }
@@ -3337,6 +3352,31 @@ class WalletStorage
     ): void {
         $this->pdo->beginTransaction();
         try {
+            $operation = $this->getPendingOperationById($id);
+            if ($operation === null) {
+                // A completed/deleted journal no longer owns any inputs or outputs.
+                $this->pdo->commit();
+                return;
+            }
+            if (!in_array($operation['type'], ['swap', 'melt'], true)
+                || ($operation['data']['input_secrets'] ?? null) !== $inputSecrets
+                || count(array_unique($inputSecrets)) !== count($inputSecrets)
+                || !in_array($inputState, [ProofState::SPENT, ProofState::UNSPENT], true)
+                || ($inputState === ProofState::UNSPENT && !empty($outputProofs))) {
+                throw new CashuException('Finalization does not match the pending spend');
+            }
+            $states = $this->getProofsStatesBySecrets($inputSecrets);
+            foreach ($inputSecrets as $secret) {
+                if (($states[$secret] ?? null) !== ProofState::PENDING) {
+                    throw new CashuException('Pending spend no longer owns a reserved input');
+                }
+            }
+            foreach ($this->getPendingOperations() as $other) {
+                if ($other['id'] !== $id
+                    && array_intersect($inputSecrets, $other['data']['input_secrets'] ?? [])) {
+                    throw new CashuException('Input is claimed by another pending operation');
+                }
+            }
             if (!empty($outputProofs)) {
                 $this->storeProofs($outputProofs);
             }
