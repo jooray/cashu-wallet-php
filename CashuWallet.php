@@ -3566,7 +3566,7 @@ class WalletStorage
     {
         $stmt = $this->pdo->prepare("
             DELETE FROM cashu_pending_operations
-            WHERE wallet_id = ? AND type NOT IN ('melt', 'swap')
+            WHERE wallet_id = ? AND type NOT IN ('mint', 'melt', 'swap')
               AND expires_at IS NOT NULL AND expires_at < ?
         ");
         $stmt->execute([$this->walletId, time()]);

@@ -223,9 +223,11 @@ final class WalletStorageTest extends TestCase
         $storage->savePendingOperation('swap:old', 'swap', ['input_secrets' => ['t']], $past);
         $storage->savePendingOperation('mint:fresh', 'mint', [], time() + 3600);
         $storage->savePendingOperation('mint:forever', 'mint', []);
+        $storage->savePendingOperation('other:old', 'other', [], $past);
 
-        $this->assertSame(1, $storage->cleanExpiredPendingOperations(), 'only the expired mint journal may be removed');
-        $this->assertNull($storage->getPendingOperationById('mint:old'));
+        $this->assertSame(1, $storage->cleanExpiredPendingOperations(), 'only non-money operations may expire');
+        $this->assertNull($storage->getPendingOperationById('other:old'));
+        $this->assertNotNull($storage->getPendingOperationById('mint:old'));
         $this->assertNotNull($storage->getPendingOperationById('melt:old'), 'expired melt journal must survive');
         $this->assertNotNull($storage->getPendingOperationById('swap:old'), 'expired swap journal must survive');
         $this->assertNotNull($storage->getPendingOperationById('mint:fresh'));
