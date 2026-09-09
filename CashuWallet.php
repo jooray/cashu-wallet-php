@@ -4679,6 +4679,87 @@ class Wallet
         return $changeProofs;
     }
 
+    /**
+     * Resolve mint operations left unfinished by a crash, timeout or lost response.
+     *
+     * Swaps and melts already had this; mints did not, so a journal whose response never
+     * arrived sat in the database forever. Two outcomes matter:
+     *
+     *  - the mint says ISSUED — it signed our outputs and the proofs are *ours*, we just
+     *    never received them. NUT-09 restores them from the journalled plan.
+     *  - the mint says the quote expired unpaid — nothing was ever issued, so the journal
+     *    describes work that can never complete and is retired.
+     *
+     * Anything else (still payable, unreachable, an answer we do not understand) is left
+     * alone: a journal is cheap, and deleting one that still owns money is not.
+     *
+     * @return array{checked:int, recovered:int, amount:int, retired:int, still_pending:int, errors:array}
+     */
+    public function recoverPendingMints(): array
+    {
+        $result = ['checked' => 0, 'recovered' => 0, 'amount' => 0, 'retired' => 0, 'still_pending' => 0, 'errors' => []];
+        if (!$this->storage) {
+            return $result;
+        }
+
+        foreach ($this->storage->getPendingOperations('mint') as $op) {
+            $result['checked']++;
+            $id = $op['id'];
+
+            // Journal ids are "mint:<quoteId>".
+            $marker = strpos($id, 'mint:');
+            if ($marker === false) {
+                $result['errors'][$id] = 'Unrecognized mint operation id';
+                continue;
+            }
+            $quoteId = substr($id, $marker + 5);
+
+            try {
+                // Already completed locally: the proofs are stored, only the journal is
+                // stale. (storeProofs records the quote id on each minted proof.)
+                if ($this->storage->getProofsByQuoteId($quoteId)) {
+                    $this->storage->deletePendingOperation($id);
+                    $result['retired']++;
+                    continue;
+                }
+
+                $quote = $this->checkMintQuote($quoteId);
+                if ($quote->quote !== $quoteId) {
+                    throw new CashuException('Mint returned a quote for a different ID');
+                }
+
+                if ($quote->isIssued()) {
+                    // The mint signed these exact outputs. Ask for them back.
+                    $proofs = $this->recoverPendingOutputs($op['data']);
+                    if (count($proofs) !== count($op['data']['amounts'] ?? [])) {
+                        // Incomplete: keep the journal rather than finalize a partial set.
+                        $result['still_pending']++;
+                        continue;
+                    }
+                    $this->storage->finalizePendingMint($quoteId, $op['data'], $proofs);
+                    $result['recovered']++;
+                    $result['amount'] += self::sumProofs($proofs);
+                    continue;
+                }
+
+                // Never issued and no longer payable: this journal owns nothing.
+                $expired = $quote->expiry !== null && $quote->expiry < time();
+                if ($expired && !$quote->isPaid()) {
+                    $this->storage->deletePendingOperation($id);
+                    $result['retired']++;
+                    continue;
+                }
+
+                $result['still_pending']++;
+            } catch (\Throwable $e) {
+                $result['still_pending']++;
+                $result['errors'][$quoteId] = $e->getMessage();
+            }
+        }
+
+        return $result;
+    }
+
     /** Recover or release swaps left ambiguous by a crash or timeout. */
     public function recoverPendingSwaps(): array
     {
