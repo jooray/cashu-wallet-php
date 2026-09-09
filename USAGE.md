@@ -22,11 +22,13 @@ This single-file PHP library (`CashuWallet.php`) provides:
 
 ### Requirements
 
-- PHP 8.0 or higher
-- `ext-gmp` (recommended) OR `ext-bcmath` for big integer math
+- PHP 8.1 or higher (`readonly` properties)
+- `ext-bcmath` and `ext-mbstring`
+- `ext-gmp` (recommended) — big-integer maths falls back to BCMath without it, much slower
 - `ext-curl` for HTTP requests
 - `ext-json` (standard)
-- `ext-pdo_sqlite` for SQLite storage (**STRONGLY RECOMMENDED**)
+- `ext-pdo_sqlite` for SQLite storage (**REQUIRED** for every money-moving operation)
+- `ext-intl` for BIP-39 NFKD normalization of non-ASCII mnemonics/passphrases
 - `bip39-english.txt` wordlist file (for mnemonic support)
 
 ## ⚠️ CRITICAL: Always Use SQLite Storage
@@ -137,14 +139,31 @@ $newProofs = $receiverWallet->receive($tokenString);
 
 The seed phrase is **required** and **critical** for wallet security:
 
-```php
-// Generate a new seed
-$seedPhrase = $wallet->generateMnemonic();
-// Returns: "abandon ability able about above absent..."
+A seed must be *bound* to its storage, and how you bind it depends on the situation.
+Getting this wrong is the classic way to lose funds, so the library makes you choose:
 
-// Or use an existing seed
-$wallet->initFromMnemonic('your twelve word seed phrase here');
+```php
+$wallet = new Wallet('https://mint.example.com', 'sat', '/path/wallet.sqlite', 'account-1');
+$wallet->loadMint();
+
+if ($wallet->getStorage()->getSeedFingerprint() === null) {
+    // (a) Brand-new wallet on empty storage.
+    $seedPhrase = Mnemonic::generate();
+    $wallet->initializeNewFromMnemonic($seedPhrase);
+
+    // (b) …or a seed that has been used before. Bind for restore and scan the mint:
+    //     resuming at counter 0 over already-used secrets destroys funds.
+    // $wallet->initializeForRestore($seedPhrase);
+    // $result = $wallet->restore();
+    // if ($result['incomplete']) { /* stays read-only; do not spend */ }
+} else {
+    // (c) Re-opening storage that is already bound to this seed.
+    $wallet->initFromMnemonic($seedPhrase);
+}
 ```
+
+`initFromMnemonic()` deliberately throws on storage that has no seed fingerprint — that
+would be case (a) or (b), and it cannot tell which one you meant.
 
 **Why seeds matter:**
 - Enable deterministic secret generation (NUT-13)
@@ -534,19 +553,24 @@ echo "New balance: " . $wallet->formatAmount($wallet->getBalance()) . "\n";
 **⚠️ WARNING: Always restore ALL units**
 
 By default, `restore()` scans ALL units from the mint, not just your wallet's primary unit.
-This is critical because melt operations (Lightning withdrawals) return fee reserve change
-in sats, regardless of the original token's unit.
 
-For example, if you melt EUR tokens to pay a Lightning invoice, any leftover fee reserve
-is returned as sat proofs. If you later restore only EUR, those sat proofs are missed,
-and their counter values may be reused - causing **proof reuse and loss of funds**.
+A seed is not owned by one unit: counters live per keyset, and any unit this seed has ever
+transacted has its own. Skipping a unit leaves its counters unscanned, so the next issuance
+there can reuse a secret — **proof reuse and loss of funds**.
+
+(NUT-08 melt change is signed on the keyset the wallet supplied, so this implementation
+receives change in its own unit. An earlier version of this document said melt change
+always came back as sats; it does not.)
 
 ```php
-// DANGEROUS: Only restores EUR, misses sat proofs from melt change
+// DANGEROUS: only scans EUR, leaves any other unit's counters unknown
 $result = $wallet->restore(allUnits: false);  // DO NOT DO THIS unless certain
 
-// SAFE: Restores all units including sat change from melt operations
+// SAFE: scans every unit the mint offers
 $result = $wallet->restore();  // allUnits: true is the default
+if ($result['incomplete']) {
+    // A keyset could not be scanned. The wallet stays read-only on purpose.
+}
 ```
 
 ## Error Handling

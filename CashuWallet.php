@@ -6757,11 +6757,11 @@ class Wallet
      * from this wallet's seed. By default, restores ALL units from the mint.
      *
      * WARNING: Setting $allUnits to false is dangerous and can cause PROOF REUSE.
-     * Melt operations (Lightning withdrawals) return fee reserve change in sats,
-     * regardless of the original token's unit. For example, melting EUR tokens
-     * returns leftover fees as sat proofs. If you only restore EUR, those sat
-     * proofs are missed, and their counter values may be reused when you later
-     * mint sats - generating duplicate secrets and losing funds.
+     * Melt change is signed on the keyset the wallet supplied, so this implementation
+     * receives it in its own unit — but a seed is not owned by one unit. Any wallet that
+     * has ever transacted another unit under the same seed has counters there too, and
+     * skipping those units leaves them unscanned; the next issuance can then reuse a
+     * secret and destroy funds.
      *
      * Always restore all units unless you are certain no cross-unit operations
      * (like melt) have ever been performed with this seed.

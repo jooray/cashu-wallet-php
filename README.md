@@ -119,13 +119,26 @@ Recovery from seed is possible but slow. SQLite provides instant counter persist
 
 Implements these Cashu NUTs:
 - [NUT-00](https://github.com/cashubtc/nuts/blob/main/00.md) - Token format (V3/V4)
+- [NUT-01](https://github.com/cashubtc/nuts/blob/main/01.md) - Mint public keys
+- [NUT-02](https://github.com/cashubtc/nuts/blob/main/02.md) - Keysets and fees (v1 + v2 IDs, `input_fee_ppk`, rotation)
 - [NUT-03](https://github.com/cashubtc/nuts/blob/main/03.md) - Swap
 - [NUT-04](https://github.com/cashubtc/nuts/blob/main/04.md) - Mint
 - [NUT-05](https://github.com/cashubtc/nuts/blob/main/05.md) - Melt
+- [NUT-06](https://github.com/cashubtc/nuts/blob/main/06.md) - Mint info
 - [NUT-07](https://github.com/cashubtc/nuts/blob/main/07.md) - Proof state
+- [NUT-08](https://github.com/cashubtc/nuts/blob/main/08.md) - Overpaid Lightning fee return
 - [NUT-09](https://github.com/cashubtc/nuts/blob/main/09.md) - Restore
-- [NUT-13](https://github.com/cashubtc/nuts/blob/main/13.md) - Deterministic secrets
-- [NUT-18](https://github.com/cashubtc/nuts/blob/main/18.md) - Payment requests (experimental)
+- [NUT-12](https://github.com/cashubtc/nuts/blob/main/12.md) - DLEQ proofs (verified on mint, swap, melt change and received tokens)
+- [NUT-13](https://github.com/cashubtc/nuts/blob/main/13.md) - Deterministic secrets (v1 BIP-32 + v2 HMAC)
+- [NUT-18](https://github.com/cashubtc/nuts/blob/main/18.md) - Payment requests (creation and parsing; paying one is not implemented)
+- [NUT-19](https://github.com/cashubtc/nuts/blob/main/19.md) - Cached responses
+- [NUT-20](https://github.com/cashubtc/nuts/blob/main/20.md) - Signature on mint quote
+- [NUT-23](https://github.com/cashubtc/nuts/blob/main/23.md) - BOLT11 payment method
+
+Not implemented: spending conditions (NUT-10/11/14), MPP (NUT-15), WebSockets (NUT-17),
+mint authentication (NUT-21/22), BOLT12 (NUT-25), bech32m payment requests (NUT-26),
+P2BK (NUT-28), batched mint (NUT-29) and onchain (NUT-30). A mint requiring NUT-21/22
+authentication is not supported.
 
 ## License
 

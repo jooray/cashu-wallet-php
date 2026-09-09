@@ -2,7 +2,7 @@
     "name": "cashu/cashu-wallet-php",
     "description": "Single-file, zero-dependency PHP implementation of the Cashu protocol. Composer is used for dev tooling (tests) only; consumers should require CashuWallet.php directly.",
     "type": "library",
-    "license": "MIT",
+    "license": "Unlicense",
     "require": {
         "php": ">=8.1",
         "ext-curl": "*",

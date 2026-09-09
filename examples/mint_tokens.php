@@ -2,141 +2,102 @@
 /**
  * Mint Tokens Example
  *
- * This example demonstrates how to mint Cashu tokens by:
- * 1. Initializing wallet with a seed (REQUIRED for recoverable tokens)
+ * Mints Cashu tokens by:
+ * 1. Opening persistent storage and binding a seed to it (required — deterministic
+ *    secrets come from the seed, and the counters that keep them unique are persisted)
  * 2. Requesting a mint quote (Lightning invoice)
  * 3. Waiting for the invoice to be paid
  * 4. Minting tokens once paid
  *
  * Usage:
- *   php mint_tokens.php [amount] [mint_url] [seed_phrase]
+ *   php mint_tokens.php [amount] [mint_url] [db_path] [seed_phrase]
  *
  * Example:
- *   php mint_tokens.php 100 https://testnut.cashu.space
- *   php mint_tokens.php 100 https://testnut.cashu.space "your twelve word seed phrase here"
+ *   php mint_tokens.php 100 https://testnut.cashu.space ./wallet.sqlite
+ *   php mint_tokens.php 100 https://testnut.cashu.space ./wallet.sqlite "twelve word seed …"
  */
 
 require_once __DIR__ . '/../CashuWallet.php';
 
-use Cashu\Wallet;
 use Cashu\CashuException;
+use Cashu\Mnemonic;
+use Cashu\Wallet;
 
-// Configuration
 $amount = (int)($argv[1] ?? 100);
 $mintUrl = $argv[2] ?? 'https://testnut.cashu.space';
-$seedPhrase = $argv[3] ?? null;
+$dbPath = $argv[3] ?? __DIR__ . '/wallet.sqlite';
+$seedPhrase = $argv[4] ?? null;
 
 echo "=== Cashu Token Minting Example ===\n\n";
 
 try {
-    // Initialize wallet
+    // Storage is not optional: minting reserves counters and journals the operation
+    // before contacting the mint, so an interrupted mint can be recovered.
     echo "Connecting to mint: $mintUrl\n";
-    $wallet = new Wallet($mintUrl);
+    echo "Wallet database:    $dbPath\n";
+    $wallet = new Wallet($mintUrl, 'sat', $dbPath, 'example');
     $wallet->loadMint();
 
-    $keysets = $wallet->getKeysets();
-    echo "Loaded " . count($keysets) . " keyset(s)\n";
+    echo "Loaded " . count($wallet->getKeysets()) . " keyset(s)\n";
     echo "Active keyset: " . $wallet->getActiveKeysetId() . "\n\n";
 
-    // Initialize seed (REQUIRED)
-    // The seed enables deterministic secret generation, allowing token recovery
-    if ($seedPhrase) {
-        echo "Using provided seed phrase\n";
-        $wallet->initFromMnemonic($seedPhrase);
+    $storage = $wallet->getStorage();
+    if ($storage->getSeedFingerprint() === null) {
+        // First run against this database.
+        if ($seedPhrase === null) {
+            $seedPhrase = Mnemonic::generate();
+            echo "Generated a new seed phrase. WRITE IT DOWN — it is the only way to\n";
+            echo "recover these tokens if the database is lost:\n\n";
+            echo "    $seedPhrase\n\n";
+            $wallet->initializeNewFromMnemonic($seedPhrase);
+        } else {
+            // A seed that has been used before needs a restore before it is safe to
+            // spend from: issuing at counter 0 over already-used secrets loses funds.
+            echo "Binding the supplied seed and scanning the mint for existing tokens…\n";
+            $wallet->initializeForRestore($seedPhrase);
+            $result = $wallet->restore();
+            if (!empty($result['incomplete'])) {
+                echo "Restore did not complete: " . json_encode($result['errors']) . "\n";
+                echo "The wallet stays read-only until a full restore succeeds.\n";
+                exit(1);
+            }
+            echo "Restored " . count($result['proofs']) . " proof(s).\n\n";
+        }
     } else {
-        echo "Generating new seed phrase...\n";
-        $seedPhrase = $wallet->generateMnemonic();
-        echo "\n";
-        echo "╔══════════════════════════════════════════════════════════════╗\n";
-        echo "║  IMPORTANT: SAVE YOUR SEED PHRASE!                          ║\n";
-        echo "╠══════════════════════════════════════════════════════════════╣\n";
-        echo "║  $seedPhrase\n";
-        echo "╠══════════════════════════════════════════════════════════════╣\n";
-        echo "║  Without this phrase, you CANNOT recover your tokens!       ║\n";
-        echo "╚══════════════════════════════════════════════════════════════╝\n";
-        echo "\n";
+        // Re-opening an existing wallet.
+        if ($seedPhrase === null) {
+            echo "This database already has a wallet; pass its seed phrase to open it.\n";
+            exit(1);
+        }
+        $wallet->initFromMnemonic($seedPhrase);
+        echo "Opened existing wallet, balance: " . $wallet->getBalance() . " sat\n\n";
     }
 
-    // Request mint quote
-    echo "Requesting mint quote for $amount sats...\n";
+    // Request the Lightning invoice.
     $quote = $wallet->requestMintQuote($amount);
+    echo "Pay this invoice ($amount sat):\n\n{$quote->request}\n\n";
+    echo "Waiting for payment (Ctrl-C to stop)…\n";
 
-    echo "\n=== MINT QUOTE ===\n";
-    echo "Quote ID: " . $quote->quote . "\n";
-    echo "Amount: " . $quote->amount . " sats\n";
-    echo "State: " . $quote->state . "\n";
-    echo "\nLightning Invoice:\n";
-    echo $quote->request . "\n\n";
-
-    // In a real application, you would display the invoice as a QR code
-    // and wait for the user to pay it
-
-    echo "=== WAITING FOR PAYMENT ===\n";
-    echo "Please pay the Lightning invoice above.\n";
-    echo "Polling for payment status...\n\n";
-
-    // Poll for payment
-    $maxAttempts = 60;
-    $attempt = 0;
-    $paid = false;
-
-    while ($attempt < $maxAttempts) {
-        $attempt++;
-        $quoteStatus = $wallet->checkMintQuote($quote->quote);
-
-        echo "Attempt $attempt: State = " . $quoteStatus->state . "\n";
-
-        if ($quoteStatus->isPaid()) {
-            $paid = true;
+    $deadline = time() + 600;
+    while (time() < $deadline) {
+        sleep(3);
+        $status = $wallet->checkMintQuote($quote->quote);
+        if ($status->isPaid() || $status->isIssued()) {
             break;
         }
-
-        // Wait 5 seconds between polls
-        sleep(5);
+        echo '.';
     }
+    echo "\n";
 
-    if (!$paid) {
-        echo "\nPayment not received within timeout.\n";
-        echo "Save the quote ID to mint later: " . $quote->quote . "\n";
+    $status = $wallet->checkMintQuote($quote->quote);
+    if (!$status->isPaid() && !$status->isIssued()) {
+        echo "Invoice was not paid in time. The quote id is {$quote->quote};\n";
+        echo "re-run with the same database to resume it.\n";
         exit(1);
     }
 
-    echo "\n=== PAYMENT RECEIVED ===\n";
-    echo "Minting tokens...\n\n";
-
-    // Mint tokens
     $proofs = $wallet->mint($quote->quote, $amount);
-
-    echo "=== TOKENS MINTED ===\n";
-    echo "Received " . count($proofs) . " proof(s)\n\n";
-
-    $totalAmount = 0;
-    foreach ($proofs as $i => $proof) {
-        echo "Proof " . ($i + 1) . ":\n";
-        echo "  Amount: " . $proof->amount . " sats\n";
-        echo "  Keyset: " . $proof->id . "\n";
-        echo "  Secret: " . substr($proof->secret, 0, 16) . "...\n";
-        $totalAmount += $proof->amount;
-    }
-
-    echo "\nTotal: $totalAmount sats\n\n";
-
-    // Serialize to token string
-    $token = $wallet->serializeToken($proofs, 'v4');
-
-    echo "=== TOKEN STRING (V4) ===\n";
-    echo $token . "\n\n";
-
-    // Also show V3 format
-    $tokenV3 = $wallet->serializeToken($proofs, 'v3');
-    echo "=== TOKEN STRING (V3) ===\n";
-    echo $tokenV3 . "\n\n";
-
-    // Save proofs to file for later use
-    $proofsJson = json_encode(array_map(fn($p) => $p->toArray(true), $proofs), JSON_PRETTY_PRINT);
-    $filename = __DIR__ . '/proofs_' . time() . '.json';
-    file_put_contents($filename, $proofsJson);
-    echo "Proofs saved to: $filename\n";
+    echo "Minted " . count($proofs) . " proof(s), balance now " . $wallet->getBalance() . " sat\n";
 
 } catch (CashuException $e) {
     echo "Error: " . $e->getMessage() . "\n";

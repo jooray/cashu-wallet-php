@@ -669,8 +669,8 @@ Restore tokens for a counter range in one batch.
 
 ```php
 public function restore(
-    int $batchSize = 25,
-    int $emptyBatches = 3,
+    int $batchSize = 100,
+    int $emptyBatches = 5,
     ?callable $progressCallback = null,
     bool $allUnits = true
 ): array
@@ -679,24 +679,30 @@ public function restore(
 Full wallet restore - scan all keysets across all units.
 
 **Parameters:**
-- `$batchSize`: Counters per batch (default: 25)
-- `$emptyBatches`: Stop after N consecutive empty batches (default: 3)
+- `$batchSize`: Counters per batch (default: 100)
+- `$emptyBatches`: Stop after N consecutive empty batches (default: 5)
 - `$progressCallback`: Called with `(keysetId, counter, proofsFound, unit)`
 - `$allUnits`: Restore ALL units from the mint (default: true)
 
-**Returns:** `array{proofs: Proof[], counters: array, byUnit: array}`
+**Returns:** `array{incomplete: bool, errors: array, proofs: Proof[], counters: array, byUnit: array}`
+- `incomplete`: **Check this.** True when a keyset could not be scanned, the mint would
+  not report proof states, or a unit's namespace belongs to a different seed. The wallet
+  is then left not-ready and refuses to spend, because resuming issuance over unscanned
+  counters reuses secrets and loses funds.
+- `errors`: Per-keyset/unit reasons for an incomplete restore
 - `proofs`: All recovered proofs across all units
 - `counters`: All keyset counters
-- `byUnit`: Results grouped by unit: `['unit' => ['proofs' => Proof[], 'counters' => array]]`
+- `byUnit`: Results grouped by unit: `['unit' => ['proofs' => …, 'unspent' => …, 'spent' => …, 'unknown' => …, 'counters' => …]]`
+  Proofs whose state the mint would not confirm are stored `UNKNOWN` and are never selectable.
 
 **⚠️ WARNING:** Setting `$allUnits` to `false` is dangerous and can cause **proof reuse**.
-Melt operations return fee reserve change in sats regardless of the original unit. If you
-only restore your primary unit, those sat proofs are missed, and their counter values may
-be reused when later minting sats - generating duplicate secrets and losing funds.
+Counters live per keyset, and a seed is not owned by one unit: any unit this seed has ever
+transacted has counters of its own. Skipping a unit leaves those unscanned, so the next
+issuance there can generate a duplicate secret and lose funds.
 
 **Example:**
 ```php
-$result = $wallet->restore(25, 3, function($ks, $ctr, $found, $unit) {
+$result = $wallet->restore(100, 5, function($ks, $ctr, $found, $unit) {
     echo "[$unit] Scanning $ks at $ctr: found $found\n";
 });
 
@@ -1014,9 +1020,13 @@ public static function deriveKeysetIdV2(
 public function deriveExpectedId(): ?string;
 ```
 
-`loadMint()` verifies every announced keyset ID against its keys (NUT-02) and
-keeps fee metadata for **inactive** keysets too, so proofs from rotated-out
-keysets stay spendable with correct fees. `Wallet::receive()` resolves NUT-00
+`loadMint()` verifies announced **V2** (`01…`) keyset IDs against their keys (NUT-02),
+using the complete announced key map — including denominations too large for a PHP int,
+which are part of the ID even though the wallet cannot transact them. V1 (`00…`) IDs are
+deliberately *not* re-derived: many production keysets were created under older rules and
+no longer verify, so for those the ID is only a stable identifier. Fee metadata is kept
+for **inactive** keysets too, so proofs from rotated-out keysets stay spendable with
+correct fees. `Wallet::receive()` resolves NUT-00
 short keyset IDs (8-byte prefix of a V2 ID) to full IDs, and verifies NUT-12
 DLEQ proofs when tokens carry them (see `Crypto::verifyDleq()`,
 `Crypto::verifyProofDleq()`). Mint quotes expose the NUT-04/NUT-23
@@ -1789,13 +1799,26 @@ class CBOR
 
 Common Cashu protocol error codes (returned in `CashuProtocolException`):
 
-| Code | Description |
-|------|-------------|
-| 10000 | Token already spent |
-| 10001 | Quote not paid |
-| 10002 | Quote expired |
-| 10003 | Invalid keyset |
-| 11001 | Insufficient funds in mint |
-| 11002 | Lightning payment failed |
+These are the codes from `cashubtc/nuts` `error_codes.md` that the library exposes as
+constants on `CashuProtocolException`. (An earlier version of this table listed codes
+that do not exist in the specification.)
 
-Check the [Cashu NUT specifications](https://github.com/cashubtc/nuts) for complete error codes.
+| Code | Constant | Meaning |
+|------|----------|---------|
+| 10001 | `PROOF_VERIFICATION_FAILED` | A proof could not be verified |
+| 11001 | `PROOFS_ALREADY_SPENT` | Inputs are already spent |
+| 11002 | `PROOFS_PENDING` | Inputs are reserved by an in-flight operation |
+| 11003 | `OUTPUTS_ALREADY_SIGNED` | These outputs were signed before |
+| 11005 | `TRANSACTION_UNBALANCED` | Inputs do not cover outputs plus fees |
+| 12001 | `KEYSET_UNKNOWN` | Unknown keyset |
+| 12002 | `KEYSET_INACTIVE` | Keyset is no longer active |
+| 12003 | `KEYSET_EXPIRED` | Keyset passed its final expiry |
+| 20001 | `QUOTE_NOT_PAID` | Mint quote has not been paid |
+| 20002 | `QUOTE_ALREADY_ISSUED` | Mint quote was already issued |
+| 20005 | `QUOTE_PENDING` | Quote is in flight |
+| 20007 | `QUOTE_EXPIRED` | Quote expired |
+| 20008 | `MINT_SIGNATURE_INVALID` | NUT-20 quote signature rejected |
+| 20009 | `MINT_PUBKEY_REQUIRED` | Mint requires a NUT-20 locked quote |
+
+`getCode()` returns the mint-provided code, or 0 when the mint sent none. Check the
+[Cashu NUT specifications](https://github.com/cashubtc/nuts) for the complete list.
