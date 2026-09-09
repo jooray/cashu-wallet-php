@@ -3057,21 +3057,31 @@ class WalletStorage
             mkdir($dir, 0700, true);
         }
 
+        // Whether we are about to create the database, decided before opening it.
+        $creating = !is_file($dbPath);
+
         $this->pdo = new \PDO("sqlite:$dbPath");
         $this->pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
         $this->pdo->exec('PRAGMA journal_mode = WAL');
-        $this->pdo->exec('PRAGMA busy_timeout = 5000');
-        self::restrictFileModes($dbPath);
+        // Two connections to one SQLite file (an application's own handle and this one)
+        // serialize their writes. 15s absorbs a slow mint round-trip held inside another
+        // connection's transaction; below that, ordinary contention surfaced to callers
+        // as "database is locked".
+        $this->pdo->exec('PRAGMA busy_timeout = 15000');
+        if ($creating) {
+            self::restrictFileModes($dbPath);
+        }
         $this->walletId = self::deriveWalletId($mintUrl, $unit, $storageIdentity);
         $this->initSchema();
     }
 
     /**
-     * Tighten permissions on the database and its WAL sidecars.
+     * Tighten permissions on a database this call just created, and its WAL sidecars.
      *
-     * The files are created with the process umask (commonly 0644). Ownership and any
-     * deliberately looser mode set by the operator are left alone: this only removes
-     * group and other access when they are present.
+     * Files are created with the process umask, commonly 0644 — world-readable bearer
+     * tokens on shared hosting. Applied only at creation: an operator who later widens
+     * the mode (a deploy user and a web-server user sharing one database, say) has made
+     * a deliberate choice, and re-tightening it on every open would silently break them.
      */
     private static function restrictFileModes(string $dbPath): void
     {
@@ -3085,6 +3095,31 @@ class WalletStorage
             }
             @chmod($file, $mode & 0777 & ~0077);
         }
+    }
+
+    /**
+     * Effective permissions of the database and its sidecars, for setup diagnostics.
+     *
+     * @return array<string, array{path: string, mode: string, groupOrWorldAccessible: bool}>
+     */
+    public static function inspectStoragePermissions(string $dbPath): array
+    {
+        $result = [];
+        foreach (['db' => $dbPath, 'wal' => $dbPath . '-wal', 'shm' => $dbPath . '-shm'] as $label => $file) {
+            if (!is_file($file)) {
+                continue;
+            }
+            $mode = @fileperms($file);
+            if ($mode === false) {
+                continue;
+            }
+            $result[$label] = [
+                'path' => $file,
+                'mode' => substr(sprintf('%o', $mode), -4),
+                'groupOrWorldAccessible' => ($mode & 0077) !== 0,
+            ];
+        }
+        return $result;
     }
 
     public static function deriveWalletId(
