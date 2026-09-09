@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Cashu\Tests;
 
 use Cashu\Keyset;
+use Cashu\CashuException;
 use Cashu\Proof;
 use Cashu\Wallet;
 use PHPUnit\Framework\TestCase;
@@ -45,7 +46,17 @@ final class FeeCalculationTest extends TestCase
         $wallet = $this->walletWithKeysets();
         $this->assertSame(100, $wallet->getInputFeePpk(self::KEYSET_FEE));
         $this->assertSame(0, $wallet->getInputFeePpk(self::KEYSET_FREE));
-        $this->assertSame(0, $wallet->getInputFeePpk('0000000000000000'), 'unknown keyset defaults to 0');
+    }
+
+    /**
+     * Guessing a zero fee for an unknown keyset produces an under-funded swap or melt
+     * that the mint only rejects after the journal reserved the inputs.
+     */
+    public function testUnknownKeysetFeeFailsClosed(): void
+    {
+        $wallet = $this->walletWithKeysets();
+        $this->expectException(CashuException::class);
+        $wallet->getInputFeePpk('0000000000000000');
     }
 
     public function testGetInputFeePpkDefaultsToActiveKeyset(): void

@@ -144,10 +144,63 @@ final class MeltChangeRecoveryTest extends TestCase
         );
     }
 
-    public function testReturnsNothingWhenQuoteHasNoChange(): void
+    /**
+     * NUT-05/NUT-23 only define `change` on the POST melt response. A mint that omits it
+     * from the GET quote response must not cost us the fee-reserve refund, so recovery
+     * asks the mint via NUT-09 whether it signed our blank outputs.
+     */
+    public function testAsksTheMintViaRestoreWhenQuoteHasNoChange(): void
     {
-        $this->assertSame([], $this->recoverMeltChange($this->pendingData([1, 1]), $this->quoteWithChange(null)));
-        $this->assertSame([], $this->recoverMeltChange($this->pendingData([1, 1]), $this->quoteWithChange([])));
+        $signature = $this->changeSignature(1, 4);
+        $blinded = $this->wallet->createDeterministicBlindedMessage(self::KEYSET, 1);
+        $this->useRestoreResponse([
+            'outputs' => [['amount' => 0, 'id' => self::KEYSET, 'B_' => $blinded['B_']]],
+            'signatures' => [$signature],
+        ]);
+
+        foreach ([null, []] as $change) {
+            $proofs = $this->recoverMeltChange(
+                $this->pendingData([0, 0]),
+                $this->quoteWithChange($change)
+            );
+            $this->assertCount(1, $proofs);
+            $this->assertSame(4, $proofs[0]->amount);
+            $this->assertSame(
+                $this->wallet->generateDeterministicSecret(self::KEYSET, 1)['secret'],
+                $proofs[0]->secret
+            );
+        }
+    }
+
+    /** A mint that signed nothing proves the refund really was zero. */
+    public function testReturnsNothingWhenRestoreFindsNoSignatures(): void
+    {
+        $this->useRestoreResponse(['outputs' => [], 'signatures' => []]);
+
+        $this->assertSame(
+            [],
+            $this->recoverMeltChange($this->pendingData([0, 0]), $this->quoteWithChange(null))
+        );
+    }
+
+    /** Swap the wallet's mint client for one that answers /v1/restore from a fixture. */
+    private function useRestoreResponse(array $response): void
+    {
+        $client = new class ($response) extends \Cashu\MintClient {
+            public function __construct(private array $response)
+            {
+                parent::__construct('https://mint.example');
+            }
+
+            public function post(string $path, array $data, ?int $timeout = null): array
+            {
+                if ($path !== 'restore') {
+                    throw new CashuException("Unexpected request: $path");
+                }
+                return $this->response;
+            }
+        };
+        (new \ReflectionProperty(Wallet::class, 'client'))->setValue($this->wallet, $client);
     }
 
     public function testReturnsNothingWithoutCounterJournalData(): void
