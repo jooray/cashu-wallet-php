@@ -165,6 +165,14 @@ if ($wallet->getStorage()->getSeedFingerprint() === null) {
 `initFromMnemonic()` deliberately throws on storage that has no seed fingerprint — that
 would be case (a) or (b), and it cannot tell which one you meant.
 
+The choice is recorded as the account's *seed provenance*
+(`$wallet->getStorage()->getSeedProvenance()['init_reason']`: `fresh_seed` or
+`restore_required`). Only case (a) is usable at once. A seed bound for restore stays
+blocked (`requiresRecovery()` is true, mint/swap/melt refuse to create outputs) until a
+recovery **completes**; `markSeedReady()` refuses such accounts. Do not decide that a seed
+is "new" because the local database is empty: a new database or account ID isolates
+storage, it does not make a used seed fresh.
+
 **Why seeds matter:**
 - Enable deterministic secret generation (NUT-13)
 - Allow full wallet recovery from seed + mint
@@ -518,15 +526,20 @@ use Cashu\Wallet;
 $wallet = new Wallet('https://testnut.cashu.space', 'sat', '/path/to/wallet.db');
 $wallet->loadMint();
 
-// Initialize with your backup seed
-$wallet->initFromMnemonic('your twelve word seed phrase here');
+// Bind the backup seed for recovery (empty storage), or reopen a bound account
+$seed = 'your twelve word seed phrase here';
+if ($wallet->getStorage()->getSeedFingerprint() === null) {
+    $wallet->initializeForRestore($seed);
+} else {
+    $wallet->initFromMnemonic($seed);
+}
 
 // Restore tokens - by default restores ALL units from the mint
 echo "Scanning for tokens...\n";
 
 $result = $wallet->restore(
-    batchSize: 25,      // Counters per batch
-    emptyBatches: 3,    // Stop after N empty batches
+    batchSize: 100,     // Counters per NUT-09 request
+    emptyBatches: 5,    // Stop after 100 × 5 = 500 consecutive unsigned counters
     progressCallback: function($keysetId, $counter, $found, $unit) {
         echo "[$unit] Keyset $keysetId, counter $counter: found $found proofs\n";
     },
@@ -572,6 +585,43 @@ if ($result['incomplete']) {
     // A keyset could not be scanned. The wallet stays read-only on purpose.
 }
 ```
+
+### Restoring in bounded steps (shared hosting, BCMath)
+
+`restore()` scans everything in one call. Without GMP that takes about a minute per keyset
+and does not fit a 30-second request. `restoreStep()` does a bounded amount of work, saves
+its progress, and continues on the next call — from a cron job, a background request, or a
+page that polls:
+
+```php
+$step = $wallet->restoreStep(
+    \Cashu\BigInt::isUsingGmp() ? 500 : 20,   // blinded messages this call
+    microtime(true) + 5                        // stop deriving more after 5 s
+);
+switch ($step['status']) {
+    case 'pending':  /* call again soon; show $step['progress'] */ break;
+    case 'complete': /* ready: $wallet->requiresRecovery() === false */ break;
+    case 'error':    /* nothing is lost; retry later. Reason: $step['error'] */ break;
+}
+
+// Anywhere, without contacting the mint:
+$status = $wallet->getRestoreStatus();   // 'none' | 'pending' | 'error' | 'complete'
+```
+
+Guarantees:
+
+- Each NUT-09 batch stores its proofs, raises counters (never lowers them) and advances the
+  checkpoint in one transaction. A timeout or crash resumes from the last batch without
+  duplicates.
+- A keyset is complete after 500 consecutive empty counters, however small the steps are.
+- The account becomes ready only when every keyset is complete and every restored proof's
+  state was confirmed by the mint. A malformed mint reply or a checkstate outage is an
+  `error`, never "empty history".
+- Proofs whose state the mint would not confirm are kept `UNKNOWN` (not spendable).
+  `reconcileUnknownProofs()` (also run by `syncProofStates()`) re-checks them without a
+  new scan; the next `restoreStep()` then completes the recovery.
+- Recovery never changes inputs that an unfinished swap or melt owns.
+
 
 ## Error Handling
 

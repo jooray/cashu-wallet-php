@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace Cashu\Tests;
 
+require_once dirname(__DIR__) . '/support/FakeRestoreMint.php';
+
 use Cashu\CashuException;
+use Cashu\Tests\Support\FakeRestoreMint;
 use Cashu\Wallet;
 use PHPUnit\Framework\TestCase;
 
@@ -86,8 +89,18 @@ final class WalletSeedTest extends TestCase
         $wallet->initializeForRestore(self::MNEMONIC);
         $this->assertTrue($wallet->requiresRecovery(), 'restore-mode seed must not spend before restore completes');
 
-        // Simulate restore completion
-        $wallet->getStorage()->markSeedReady();
+        // Readiness comes only from a completed recovery, never from markSeedReady().
+        try {
+            $wallet->getStorage()->markSeedReady();
+            $this->fail('A restore-mode seed was readied without recovery');
+        } catch (CashuException $e) {
+            $this->assertTrue($wallet->requiresRecovery());
+        }
+        $mint = new FakeRestoreMint([['id' => '009a1f293253e41e', 'unit' => 'sat', 'active' => true]]);
+        (new \ReflectionProperty(Wallet::class, 'client'))->setValue($wallet, $mint);
+        $this->assertFalse($wallet->restore(10, 1)['incomplete']);
+        $this->assertFalse($wallet->requiresRecovery());
+
         $reopened = new Wallet('https://mint.example', 'sat', $this->dbPath);
         $reopened->initFromMnemonic(self::MNEMONIC);
         $this->assertFalse($reopened->requiresRecovery());

@@ -390,6 +390,9 @@ final class AuditRemediationTest extends TestCase
             'bcscale(2);',
             "require getenv('CASHU_LIB');",
             "(new ReflectionProperty(Cashu\\BigInt::class, 'useGmp'))->setValue(null, false);",
+            // Without this, BigInt::init() re-detects GMP and the test never ran BCMath.
+            "(new ReflectionProperty(Cashu\\BigInt::class, 'initialized'))->setValue(null, true);",
+            'if (Cashu\\BigInt::isUsingGmp()) { fwrite(STDERR, "GMP still active"); }',
             '$out = [',
             'Cashu\\BigInt::fromDec(3)->add(Cashu\\BigInt::fromDec(0))->toDec(),',
             'Cashu\\BigInt::fromDec(3)->isOdd() ? "odd" : "even",',

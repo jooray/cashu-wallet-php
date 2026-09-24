@@ -468,14 +468,83 @@ final class WalletStorageTest extends TestCase
         $storage->markSeedReady();
     }
 
-    public function testMarkSeedReadyPromotesRestoreAccounts(): void
+    /**
+     * Review R1: only a completed recovery may ready an account bound for restore. An
+     * empty database does not prove the seed never used this mint.
+     */
+    public function testMarkSeedReadyRefusesRestoreAccounts(): void
     {
         $storage = $this->storage();
         $storage->bindSeedFingerprint('fp-restore', true, false);
         $this->assertFalse($storage->isSeedReady());
+        $this->assertSame(WalletStorage::INIT_RESTORE_REQUIRED, $storage->getSeedProvenance()['init_reason']);
 
-        $storage->markSeedReady();
-        $this->assertTrue($storage->isSeedReady());
+        try {
+            $storage->markSeedReady();
+            $this->fail('A restore-required account was readied without recovery');
+        } catch (CashuException $e) {
+            $this->assertFalse($storage->isSeedReady());
+        }
+    }
+
+    public function testBindingRecordsProvenance(): void
+    {
+        $fresh = $this->storage('sat', 'fresh');
+        $fresh->bindSeedFingerprint('fp', true);
+        $provenance = $fresh->getSeedProvenance();
+        $this->assertSame(WalletStorage::INIT_FRESH_SEED, $provenance['init_reason']);
+        $this->assertTrue($provenance['ready']);
+        $this->assertSame(WalletStorage::READY_FRESH_SEED, $provenance['ready_reason']);
+        $this->assertFalse($provenance['legacy']);
+        $fresh->markSeedReady(); // idempotent on a ready account
+
+        // L-11: adopting EMPTY storage must not make the seed ready at counter 0.
+        $emptyAdopt = $this->storage('sat', 'adopt-empty');
+        $emptyAdopt->bindSeedFingerprint('fp', false);
+        $this->assertFalse($emptyAdopt->isSeedReady());
+        $this->assertSame(WalletStorage::INIT_RESTORE_REQUIRED, $emptyAdopt->getSeedProvenance()['init_reason']);
+
+        // Adopting storage that holds the seed's history keeps it usable.
+        $dataAdopt = $this->storage('sat', 'adopt-data');
+        $dataAdopt->storeProofs([self::proof(1, 'history')]);
+        $dataAdopt->raiseCounter(self::KEYSET, 7);
+        $dataAdopt->bindSeedFingerprint('fp', false);
+        $this->assertTrue($dataAdopt->isSeedReady());
+        $this->assertSame(WalletStorage::INIT_ADOPTED_STORAGE, $dataAdopt->getSeedProvenance()['init_reason']);
+        $this->assertSame(7, $dataAdopt->getCounter(self::KEYSET));
+    }
+
+    /** Review R1 case 7: upgrading keeps legacy rows exactly as they were. */
+    public function testLegacyMetadataRowsKeepTheirReadiness(): void
+    {
+        // A database created by the previous schema (no provenance columns).
+        $pdo = new \PDO('sqlite:' . $this->dbPath);
+        $pdo->exec('CREATE TABLE cashu_wallet_metadata (wallet_id TEXT PRIMARY KEY,
+            seed_fingerprint TEXT NOT NULL, ready INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)');
+        $pdo->exec('CREATE TABLE cashu_counters (wallet_id TEXT NOT NULL, keyset_id TEXT NOT NULL,
+            counter INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(wallet_id, keyset_id))');
+        $readyId = WalletStorage::deriveWalletId(self::MINT, 'sat', 'legacy-ready');
+        $blockedId = WalletStorage::deriveWalletId(self::MINT, 'sat', 'legacy-blocked');
+        $pdo->prepare('INSERT INTO cashu_wallet_metadata VALUES (?, ?, ?, ?)')->execute([$readyId, 'fp', 1, 1]);
+        $pdo->prepare('INSERT INTO cashu_wallet_metadata VALUES (?, ?, ?, ?)')->execute([$blockedId, 'fp', 0, 1]);
+        $pdo->prepare('INSERT INTO cashu_counters VALUES (?, ?, ?)')->execute([$readyId, self::KEYSET, 42]);
+        $pdo = null;
+
+        $ready = $this->storage('sat', 'legacy-ready');
+        $this->assertTrue($ready->isSeedReady());
+        $this->assertSame(42, $ready->getCounter(self::KEYSET));
+        $provenance = $ready->getSeedProvenance();
+        $this->assertNull($provenance['init_reason']);
+        $this->assertTrue($provenance['legacy']);
+        $this->assertSame('legacy', $provenance['ready_reason']);
+        $ready->markSeedReady();
+        $this->assertSame(42, $ready->getCounter(self::KEYSET));
+
+        $blocked = $this->storage('sat', 'legacy-blocked');
+        $this->assertFalse($blocked->isSeedReady());
+        $this->assertTrue($blocked->getSeedProvenance()['requires_recovery']);
+        $this->expectException(CashuException::class);
+        $blocked->markSeedReady();
     }
 
     public function testListWallets(): void
