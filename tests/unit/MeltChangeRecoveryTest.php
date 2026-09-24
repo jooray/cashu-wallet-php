@@ -238,14 +238,64 @@ final class MeltChangeRecoveryTest extends TestCase
         $this->recoverMeltChange($pending, $this->quoteWithChange([$sig]));
     }
 
-    public function testRejectsNonPositiveChangeAmounts(): void
+    public function testRejectsNegativeOrMissingChangeAmounts(): void
     {
-        $pending = $this->pendingData([1, 1]);
-        $sig = $this->changeSignature(0, 2);
-        $sig['amount'] = 0;
+        foreach ([-2, null, '2'] as $amount) {
+            $sig = $this->changeSignature(0, 2);
+            $sig['amount'] = $amount;
+            try {
+                $this->recoverMeltChange($this->pendingData([1, 1]), $this->quoteWithChange([$sig]));
+                $this->fail('Accepted change amount ' . var_export($amount, true));
+            } catch (CashuException $e) {
+                $this->assertStringContainsString('does not match the prepared outputs', $e->getMessage());
+            }
+        }
+    }
 
+    /**
+     * Some mints sign unused blank outputs with amount 0 instead of omitting them.
+     * They carry no value; rejecting them after the payment succeeded would leave the
+     * melt journal unfinalized (L-13).
+     */
+    public function testSkipsZeroAmountChangeSignatures(): void
+    {
+        $zero = ['id' => self::KEYSET, 'amount' => 0, 'C_' => str_repeat('02', 33)];
+        $quote = $this->quoteWithChange([$zero, $this->changeSignature(1, 4), $zero]);
+
+        $proofs = $this->recoverMeltChange($this->pendingData([0, 0, 0]), $quote);
+
+        $this->assertCount(1, $proofs);
+        $this->assertSame(4, $proofs[0]->amount);
+        $this->assertSame(
+            $this->wallet->generateDeterministicSecret(self::KEYSET, 1)['secret'],
+            $proofs[0]->secret
+        );
+
+        // Zero-amount signatures still have to come from our keyset.
+        $zero['id'] = '00ad268c4d1f5826';
         $this->expectException(CashuException::class);
-        $this->recoverMeltChange($pending, $this->quoteWithChange([$sig]));
+        $this->recoverMeltChange($this->pendingData([0, 0]), $this->quoteWithChange([$zero]));
+    }
+
+    public function testNut09RecoverySkipsZeroAmountChangeSignatures(): void
+    {
+        $blank0 = $this->wallet->createDeterministicBlindedMessage(self::KEYSET, 0);
+        $blank1 = $this->wallet->createDeterministicBlindedMessage(self::KEYSET, 1);
+        $this->useRestoreResponse([
+            'outputs' => [
+                ['amount' => 0, 'id' => self::KEYSET, 'B_' => $blank0['B_']],
+                ['amount' => 0, 'id' => self::KEYSET, 'B_' => $blank1['B_']],
+            ],
+            'signatures' => [
+                ['id' => self::KEYSET, 'amount' => 0, 'C_' => str_repeat('02', 33)],
+                $this->changeSignature(1, 2),
+            ],
+        ]);
+
+        $proofs = $this->recoverMeltChange($this->pendingData([0, 0]), $this->quoteWithChange(null));
+
+        $this->assertCount(1, $proofs);
+        $this->assertSame(2, $proofs[0]->amount);
     }
 
     public function testMeltQuoteFromArrayAndStateHelpers(): void

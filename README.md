@@ -78,7 +78,7 @@ The test wallet provides a menu-driven interface to:
 
 ## Requirements
 
-- PHP 8.0 or higher
+- PHP 8.1 or higher
 - `ext-gmp` (recommended) OR `ext-bcmath` for big integer math
 - `ext-curl` for HTTP requests
 - `ext-json` (standard)

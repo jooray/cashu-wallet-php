@@ -6,7 +6,7 @@
  * Supports minting, melting, swapping, sending, and receiving Cashu tokens.
  *
  * Requirements:
- * - PHP 8.0+
+ * - PHP 8.1+
  * - ext-gmp OR ext-bcmath (for big integer math; GMP preferred for performance)
  * - ext-curl (for HTTP)
  * - ext-json (standard)
@@ -1892,6 +1892,29 @@ class Keyset
     }
 
     /**
+     * How well this wallet can derive outputs (NUT-13) for a keyset ID:
+     * 2 = V2 ("01"), 1 = V1 ("00") or pre-V1 base64, 0 = a version it cannot use
+     * (e.g. v3/BLS "02"). Only keysets ranked above 0 may receive new outputs.
+     */
+    public static function idVersionRank(string $id): int
+    {
+        if (ctype_xdigit($id)) {
+            $version = strtolower(substr($id, 0, 2));
+            if (strlen($id) === 66 && $version === '01') {
+                return 2;
+            }
+            if (strlen($id) === 16 && $version === '00') {
+                return 1;
+            }
+        }
+        // Same acceptance rule as Wallet::keysetIdToInt() for pre-V1 IDs.
+        if (strlen($id) === 12 && base64_decode($id, true) !== false) {
+            return 1;
+        }
+        return 0;
+    }
+
+    /**
      * Derive the expected ID for this keyset using the version encoded in its
      * announced ID. Returns null for legacy (base64) IDs that cannot be verified.
      */
@@ -2928,6 +2951,30 @@ class MintClient
     }
 
     /**
+     * cURL options restricting a handle (and any redirect) to HTTP(S).
+     *
+     * CURLOPT_PROTOCOLS_STR exists only on PHP >= 8.3 built against libcurl >= 7.85;
+     * referencing it unguarded is a fatal \Error, not a CashuException. The older
+     * bitmask options are deprecated there, so they are used only as the fallback.
+     * Merge with `+` (not array_merge, which renumbers the integer keys).
+     *
+     * @return array<int, string|int>
+     */
+    public static function curlProtocolOptions(): array
+    {
+        if (defined('CURLOPT_PROTOCOLS_STR') && defined('CURLOPT_REDIR_PROTOCOLS_STR')) {
+            return [
+                CURLOPT_PROTOCOLS_STR => 'https,http',
+                CURLOPT_REDIR_PROTOCOLS_STR => 'https,http',
+            ];
+        }
+        return [
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS | CURLPROTO_HTTP,
+            CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS | CURLPROTO_HTTP,
+        ];
+    }
+
+    /**
      * Make a GET request
      */
     public function get(string $path): array
@@ -2960,8 +3007,6 @@ class MintClient
             CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
-            CURLOPT_PROTOCOLS_STR => 'https,http',
-            CURLOPT_REDIR_PROTOCOLS_STR => 'https,http',
             CURLOPT_USERAGENT => 'cashu-wallet-php',
             CURLOPT_HTTPHEADER => [
                 'Content-Type: application/json',
@@ -2975,7 +3020,7 @@ class MintClient
                 }
                 return strlen($chunk);
             },
-        ]);
+        ] + self::curlProtocolOptions());
 
         if ($method === 'POST') {
             curl_setopt($ch, CURLOPT_POST, true);
@@ -4656,10 +4701,18 @@ class Wallet
             // NUT-08: the mint ignores the amounts on the wallet's change outputs and
             // assigns its own (the decomposed overpaid fees), so only the keyset and
             // output count can be validated — not the amounts.
+            $changeAmount = $sig['amount'] ?? null;
             if (!isset($blindingData[$i])
                 || ($sig['id'] ?? null) !== $keysetId
-                || (int)($sig['amount'] ?? 0) <= 0) {
+                || !is_int($changeAmount) || $changeAmount < 0) {
                 throw new CashuException('Mint returned melt change that does not match the prepared outputs');
+            }
+            // Some mints sign unused blank outputs with amount 0 (the spec says they
+            // should omit them). Such a signature carries no value and has no key to
+            // unblind with; throwing here, after the payment went through, would leave
+            // the journal unfinalized. Its counter was reserved with the others.
+            if ($changeAmount === 0) {
+                continue;
             }
 
             $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
@@ -4851,10 +4904,16 @@ class Wallet
             $blinded = $plan[$key];
             if (($output['id'] ?? null) !== $blinded['id']
                 || ($signature['id'] ?? null) !== $blinded['id']
-                || !is_int($signature['amount'] ?? null) || $signature['amount'] <= 0
+                || !is_int($signature['amount'] ?? null) || $signature['amount'] < 0
+                || ($signature['amount'] === 0 && $fixedAmounts)
                 || ($fixedAmounts && (($output['amount'] ?? null) !== $blinded['amount']
                     || $signature['amount'] !== $blinded['amount']))) {
                 throw new CashuException('Restored signature does not match the prepared output');
+            }
+            // A zero-amount signature on a blank melt-change output carries no value
+            // (see melt()); skip it rather than fail the whole recovery.
+            if ($signature['amount'] === 0) {
+                continue;
             }
             $pubkey = $this->getPublicKey($signature['id'], $signature['amount']);
             $this->verifyChangeSignatureDleq($signature, $blinded, $pubkey);
@@ -5193,10 +5252,26 @@ class Wallet
      */
     public function getActiveKeysetId(): string
     {
+        // Only keysets whose ID version we can derive are candidates (a mint that
+        // activates a v3/BLS keyset must not break mint/swap/melt); prefer V2 over
+        // V1. Unusable keysets stay loaded so their existing proofs keep their fees.
+        $best = null;
+        $bestRank = 0;
         foreach ($this->keysets as $keyset) {
-            if ($keyset->active) {
-                return $keyset->id;
+            if (!$keyset->active) {
+                continue;
             }
+            $rank = Keyset::idVersionRank($keyset->id);
+            if ($rank > $bestRank) {
+                $best = $keyset;
+                $bestRank = $rank;
+            }
+        }
+        if ($best !== null) {
+            return $best->id;
+        }
+        if (!empty($this->keysets)) {
+            throw new CashuException('Mint has no active keyset with a supported ID version');
         }
         throw new CashuException('Mint not loaded. Call loadMint() first.');
     }
@@ -5748,10 +5823,18 @@ class Wallet
             // NUT-08: the mint ignores the amounts on the wallet's change outputs and
             // assigns its own (the decomposed overpaid fees), so only the keyset and
             // output count can be validated — not the amounts.
+            $changeAmount = $sig['amount'] ?? null;
             if (!isset($blindingData[$i])
                 || ($sig['id'] ?? null) !== $keysetId
-                || (int)($sig['amount'] ?? 0) <= 0) {
+                || !is_int($changeAmount) || $changeAmount < 0) {
                 throw new CashuException('Mint returned melt change that does not match the prepared outputs');
+            }
+            // Some mints sign unused blank outputs with amount 0 (the spec says they
+            // should omit them). Such a signature carries no value and has no key to
+            // unblind with; throwing here, after the payment went through, would leave
+            // the journal unfinalized. Its counter was reserved with the others.
+            if ($changeAmount === 0) {
+                continue;
             }
             $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
             $this->verifyChangeSignatureDleq($sig, $blindingData[$i], $pubkey);
@@ -6528,6 +6611,23 @@ class Wallet
     }
 
     /**
+     * Whether generateDeterministicSecret() supports this keyset ID's version.
+     * Mirrors its dispatch exactly, so restore() skips only what it could never scan.
+     */
+    private function canDeriveSecretsFor(string $keysetId): bool
+    {
+        if (strlen($keysetId) === 66 && ctype_xdigit($keysetId)) {
+            return strtolower(substr($keysetId, 0, 2)) === '01';
+        }
+        try {
+            $this->keysetIdToInt($keysetId);
+            return true;
+        } catch (CashuException $e) {
+            return false;
+        }
+    }
+
+    /**
      * Generate deterministic secret and blinding factor for a keyset/counter (NUT-13)
      *
      * V2 keysets (ID version byte "01"): HMAC-SHA256 KDF —
@@ -6889,6 +6989,7 @@ class Wallet
      *                       WARNING: Setting to false risks proof reuse - see above.
      * @return array ['proofs' => Proof[], 'counters' => array, 'byUnit' => array]
      *               'byUnit' contains ['unit' => ['proofs' => [], 'counters' => []]]
+     *               'skippedKeysets' lists keyset IDs of a version this wallet cannot derive
      */
     public function restore(
         // Wider gap tolerance by default: failed operations burn counters, leaving gaps.
@@ -6908,6 +7009,7 @@ class Wallet
         $byUnit = [];
         $restoreIncomplete = false;
         $restoreErrors = [];
+        $skippedKeysets = [];
 
         // Get all keysets from the mint
         $keysetsResponse = $this->client->get('keysets');
@@ -6942,6 +7044,14 @@ class Wallet
             // Load keys for each keyset in this unit
             foreach ($keysets as $ks) {
                 $keysetId = $ks['id'];
+
+                // A keyset whose ID version we cannot derive secrets for (e.g. v3/BLS)
+                // never received outputs from this wallet, so it holds nothing to
+                // restore. Skip it instead of letting it abort the whole scan.
+                if (!$this->canDeriveSecretsFor($keysetId)) {
+                    $skippedKeysets[] = $keysetId;
+                    continue;
+                }
 
                 // Load keys for this keyset if not already loaded
                 if (!isset($this->keys[$keysetId])) {
@@ -7161,6 +7271,7 @@ class Wallet
             'proofs' => $allProofs,
             'counters' => $finalCounters,
             'byUnit' => $byUnit,
+            'skippedKeysets' => $skippedKeysets,
         ];
     }
 
@@ -7499,7 +7610,6 @@ class LightningAddress
             CURLOPT_TIMEOUT => $timeout,
             CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_FOLLOWLOCATION => false,
-            CURLOPT_PROTOCOLS_STR => 'https,http',
             CURLOPT_HTTPHEADER => ['Accept: application/json'],
             CURLOPT_USERAGENT => 'cashu-wallet-php',
             CURLOPT_WRITEFUNCTION => function ($handle, $chunk) use (&$body, &$tooLarge) {
@@ -7510,7 +7620,7 @@ class LightningAddress
                 }
                 return strlen($chunk);
             },
-        ]);
+        ] + MintClient::curlProtocolOptions());
 
         curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);

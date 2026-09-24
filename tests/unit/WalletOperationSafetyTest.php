@@ -205,4 +205,38 @@ final class WalletOperationSafetyTest extends TestCase
             $this->assertSame(0, $storage->getBalance());
         }
     }
+
+    /**
+     * L-13: a mint that signs unused blank change outputs with amount 0 after paying
+     * the invoice must not make melt() throw and strand the journal and inputs.
+     */
+    public function testMeltFinalizesWhenMintReturnsZeroAmountChange(): void
+    {
+        $submitted = [];
+        $wallet = $this->wallet(function ($path, $data) use (&$submitted): array {
+            $this->assertSame('melt/bolt11', $path);
+            $submitted = $data['outputs'];
+            $zero = $this->signature($data['outputs'][0]);
+            $zero['amount'] = 0;
+            $two = $this->signature($data['outputs'][1]);
+            $two['amount'] = 2;
+            return ['state' => 'PAID', 'payment_preimage' => 'feed', 'change' => [$zero, $two]];
+        }, fn() => ['quote' => 'q', 'amount' => 5, 'fee_reserve' => 1, 'state' => 'UNPAID']);
+
+        $result = $wallet->melt('q', [new Proof(self::KEYSET, 8, 'melt-input', self::G)]);
+
+        $this->assertTrue($result['paid']);
+        $this->assertCount(2, $submitted, 'max change 3 needs two blank outputs');
+        $this->assertCount(1, $result['change']);
+        $this->assertSame(2, $result['change'][0]->amount);
+        $this->assertSame(
+            $wallet->generateDeterministicSecret(self::KEYSET, 1)['secret'],
+            $result['change'][0]->secret
+        );
+        $storage = $wallet->getStorage();
+        $this->assertNull($storage->getPendingOperationById('melt:q'));
+        $this->assertSame(ProofState::SPENT, $storage->getProofsStatesBySecrets(['melt-input'])['melt-input']);
+        $this->assertSame(2, $storage->getBalance());
+        $this->assertSame(2, $storage->getCounter(self::KEYSET), 'both blank counters stay consumed');
+    }
 }

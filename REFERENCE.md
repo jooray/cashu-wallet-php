@@ -684,7 +684,7 @@ Full wallet restore - scan all keysets across all units.
 - `$progressCallback`: Called with `(keysetId, counter, proofsFound, unit)`
 - `$allUnits`: Restore ALL units from the mint (default: true)
 
-**Returns:** `array{incomplete: bool, errors: array, proofs: Proof[], counters: array, byUnit: array}`
+**Returns:** `array{incomplete: bool, errors: array, proofs: Proof[], counters: array, byUnit: array, skippedKeysets: string[]}`
 - `incomplete`: **Check this.** True when a keyset could not be scanned, the mint would
   not report proof states, or a unit's namespace belongs to a different seed. The wallet
   is then left not-ready and refuses to spend, because resuming issuance over unscanned
@@ -694,6 +694,7 @@ Full wallet restore - scan all keysets across all units.
 - `counters`: All keyset counters
 - `byUnit`: Results grouped by unit: `['unit' => ['proofs' => …, 'unspent' => …, 'spent' => …, 'unknown' => …, 'counters' => …]]`
   Proofs whose state the mint would not confirm are stored `UNKNOWN` and are never selectable.
+- `skippedKeysets`: IDs of keysets whose ID version this wallet cannot derive secrets for (e.g. v3/BLS `02…`). The wallet never issued outputs on them, so they are skipped instead of aborting the restore.
 
 **⚠️ WARNING:** Setting `$allUnits` to `false` is dangerous and can cause **proof reuse**.
 Counters live per keyset, and a seed is not owned by one unit: any unit this seed has ever
@@ -789,7 +790,7 @@ Wallet::formatAmountForUnit(150, 'usd'); // "$1.50"
 | `getUnit()` | `string` | Currency unit |
 | `getMintInfo()` | `?array` | Mint info from `/v1/info` |
 | `getKeysets()` | `Keyset[]` | Loaded keysets |
-| `getActiveKeysetId()` | `string` | Active keyset ID |
+| `getActiveKeysetId()` | `string` | Active keyset used for new outputs: V2 (`01…`) preferred over V1 (`00…`); keysets with an unsupported ID version are never chosen |
 | `getPublicKey($keysetId, $amount)` | `string` | Public key (hex) |
 | `getInputFeePpk($keysetId)` | `int` | Fee rate in PPK |
 | `getUnitHelper()` | `Unit` | Unit formatting helper |
