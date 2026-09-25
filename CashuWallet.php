@@ -6805,7 +6805,7 @@ class Wallet
                 $changeProofs = empty($changeAmounts)
                     ? []
                     : $this->recoverMeltChange($pendingData, $reconciledQuote);
-            } catch (CashuException $changeError) {
+            } catch (\Throwable $changeError) {
                 // Paid, but the refund is still at the mint. recoverPendingMelts() retries
                 // with the retained journal; the inputs stay reserved (they are spent).
                 return [
@@ -6817,19 +6817,83 @@ class Wallet
                     'changeRecoveryError' => $changeError->getMessage(),
                 ];
             }
-            $this->storage->finalizePendingSpend($pendingId, $inputSecrets, ProofState::SPENT, $changeProofs);
+            return $this->finalizePaidMelt($pendingId, $inputSecrets, $changeProofs, $preimage);
+        }
+
+        // Check payment state first - mints may return lowercase
+        $paymentState = strtoupper($response['state'] ?? '');
+        $isPaid = $paymentState === 'PAID';
+        $isPending = $paymentState === 'PENDING';
+        $preimage = $response['payment_preimage'] ?? null;
+
+        if (!$isPaid) {
+            // Ambiguous and unpaid responses remain reserved until quote recovery decides.
             return [
-                'paid' => true,
-                'pending' => false,
+                'paid' => false,
+                'pending' => $isPending,
                 'preimage' => $preimage,
-                'change' => $changeProofs,
+                'change' => [],
                 'changeRecoveryPending' => false,
             ];
         }
 
-        // Process change
+        // The mint says PAID: the Lightning payment has gone out. From here on nothing
+        // may throw (audit N4). A caller that sees an exception reasonably treats the
+        // withdrawal as failed and tries again with a new quote, which pays twice. If
+        // the change cannot be unblinded or the result cannot be saved, report the
+        // payment and keep the journal; recoverPendingMelts() collects the change
+        // through NUT-09 and finalizes it later.
+        try {
+            $changeProofs = $this->unblindMeltChange($response['change'] ?? [], $blindingData, $keysetId);
+        } catch (\Throwable $changeError) {
+            return [
+                'paid' => true,
+                'pending' => false,
+                'preimage' => $preimage,
+                'change' => [],
+                'changeRecoveryPending' => true,
+                'changeRecoveryError' => $changeError->getMessage(),
+            ];
+        }
+        return $this->finalizePaidMelt($pendingId, $inputSecrets, $changeProofs, $preimage);
+    }
+
+    /**
+     * Record a paid melt, or — if saving fails — say so without throwing. The journal
+     * written before the POST survives a failed finalization, so recovery completes it.
+     */
+    private function finalizePaidMelt(string $pendingId, array $inputSecrets, array $changeProofs, ?string $preimage): array
+    {
+        try {
+            $this->storage->finalizePendingSpend($pendingId, $inputSecrets, ProofState::SPENT, $changeProofs);
+        } catch (\Throwable $finalizeError) {
+            return [
+                'paid' => true,
+                'pending' => false,
+                'preimage' => $preimage,
+                'change' => [],
+                'changeRecoveryPending' => true,
+                'changeRecoveryError' => 'The payment went through but could not be recorded yet: '
+                    . $finalizeError->getMessage(),
+            ];
+        }
+        return [
+            'paid' => true,
+            'pending' => false,
+            'preimage' => $preimage,
+            'change' => $changeProofs,
+            'changeRecoveryPending' => false,
+        ];
+    }
+
+    /**
+     * Unblind the change a PAID melt response carries (NUT-08).
+     *
+     * @return Proof[]
+     */
+    private function unblindMeltChange(array $changeSignatures, array $blindingData, string $keysetId): array
+    {
         $changeProofs = [];
-        $changeSignatures = $response['change'] ?? [];
         if (count($changeSignatures) > count($blindingData)) {
             throw new CashuException('Mint returned more melt change signatures than prepared outputs');
         }
@@ -6845,8 +6909,7 @@ class Wallet
             }
             // Some mints sign unused blank outputs with amount 0 (the spec says they
             // should omit them). Such a signature carries no value and has no key to
-            // unblind with; throwing here, after the payment went through, would leave
-            // the journal unfinalized. Its counter was reserved with the others.
+            // unblind with. Its counter was reserved with the others.
             if ($changeAmount === 0) {
                 continue;
             }
@@ -6861,31 +6924,7 @@ class Wallet
                 $C
             );
         }
-
-        // Check payment state - mints may return lowercase
-        $paymentState = strtoupper($response['state'] ?? '');
-        $isPaid = $paymentState === 'PAID';
-        $isPending = $paymentState === 'PENDING';
-
-        if ($isPaid) {
-            $this->storage->finalizePendingSpend(
-                $pendingId,
-                $inputSecrets,
-                ProofState::SPENT,
-                $changeProofs
-            );
-        } else {
-            // Ambiguous and unpaid responses remain reserved until quote recovery decides.
-            $changeProofs = [];
-        }
-
-        return [
-            'paid' => $isPaid,
-            'pending' => $isPending,
-            'preimage' => $response['payment_preimage'] ?? null,
-            'change' => $changeProofs,
-            'changeRecoveryPending' => false,
-        ];
+        return $changeProofs;
     }
 
     // ========================================================================

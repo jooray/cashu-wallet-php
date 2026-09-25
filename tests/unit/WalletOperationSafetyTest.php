@@ -239,4 +239,85 @@ final class WalletOperationSafetyTest extends TestCase
         $this->assertSame(2, $storage->getBalance());
         $this->assertSame(2, $storage->getCounter(self::KEYSET), 'both blank counters stay consumed');
     }
+
+    /** A mint that pays the melt and can hand the change back through NUT-09. */
+    private function paidMeltWallet(array &$submitted, callable $changeFor): Wallet
+    {
+        $paid = false;
+        $wallet = $this->wallet(function ($path, $data) use (&$submitted, &$paid, $changeFor): array {
+            if ($path === 'melt/bolt11') {
+                $paid = true;
+                $submitted = $data['outputs'];
+                return ['state' => 'PAID', 'payment_preimage' => 'feed', 'change' => $changeFor($data['outputs'])];
+            }
+            if ($path === 'restore') {
+                $two = $this->signature($submitted[1]);
+                $two['amount'] = 2;
+                return ['outputs' => [$submitted[1]], 'signatures' => [$two]];
+            }
+            if ($path === 'checkstate') {
+                return ['states' => array_map(fn($y) => ['Y' => $y, 'state' => 'SPENT'], $data['Ys'])];
+            }
+            throw new CashuException("unexpected $path");
+        }, function ($path) use (&$paid) {
+            return str_contains($path, 'melt/quote')
+                ? ['quote' => 'q', 'amount' => 5, 'fee_reserve' => 1, 'state' => $paid ? 'PAID' : 'UNPAID',
+                   'payment_preimage' => $paid ? 'feed' : null]
+                : throw new CashuException("unexpected GET $path");
+        });
+        return $wallet;
+    }
+
+    public function testMeltReportsPaidWhenRecordingTheResultFails(): void
+    {
+        // N4: the mint paid the invoice, then the database refused the write. Throwing
+        // here made callers retry with a new quote and pay twice.
+        $submitted = [];
+        $wallet = $this->paidMeltWallet($submitted, function (array $outputs): array {
+            $two = $this->signature($outputs[1]);
+            $two['amount'] = 2;
+            return [$two];
+        });
+        $pdo = new \PDO('sqlite:' . $this->db);
+        $pdo->exec("CREATE TRIGGER refuse_finalize BEFORE UPDATE ON cashu_proofs
+                    BEGIN SELECT RAISE(ABORT, 'disk full'); END");
+
+        $result = $wallet->melt('q', [new Proof(self::KEYSET, 8, 'melt-input', self::G)]);
+
+        $this->assertTrue($result['paid'], 'a paid melt is reported as paid even if it cannot be recorded');
+        $this->assertTrue($result['changeRecoveryPending']);
+        $this->assertStringContainsString('disk full', $result['changeRecoveryError']);
+        $this->assertNotNull($wallet->getStorage()->getPendingOperationById('melt:q'), 'the journal is kept');
+
+        $pdo->exec('DROP TRIGGER refuse_finalize');
+        $wallet->recoverPendingMelts();
+        $storage = $wallet->getStorage();
+        $this->assertNull($storage->getPendingOperationById('melt:q'), 'recovery finishes it');
+        $this->assertSame(ProofState::SPENT, $storage->getProofsStatesBySecrets(['melt-input'])['melt-input']);
+        $this->assertSame(2, $storage->getBalance(), 'and collects the change');
+    }
+
+    public function testMeltReportsPaidWhenTheChangeIsUnusable(): void
+    {
+        $submitted = [];
+        $wallet = $this->paidMeltWallet($submitted, function (array $outputs): array {
+            $bad = $this->signature($outputs[1]);
+            $bad['amount'] = 2;
+            $bad['id'] = '00ffffffffffffff'; // not the keyset we prepared outputs for
+            return [$bad];
+        });
+
+        $result = $wallet->melt('q', [new Proof(self::KEYSET, 8, 'melt-input', self::G)]);
+
+        $this->assertTrue($result['paid'], 'bad change after payment does not turn into "failed"');
+        $this->assertTrue($result['changeRecoveryPending']);
+        $this->assertNotNull($wallet->getStorage()->getPendingOperationById('melt:q'));
+        $this->assertNotSame(ProofState::UNSPENT,
+            $wallet->getStorage()->getProofsStatesBySecrets(['melt-input'])['melt-input'],
+            'the spent input never becomes spendable again');
+
+        $wallet->recoverPendingMelts();
+        $this->assertNull($wallet->getStorage()->getPendingOperationById('melt:q'));
+        $this->assertSame(2, $wallet->getStorage()->getBalance(), 'the change is recovered through NUT-09');
+    }
 }
