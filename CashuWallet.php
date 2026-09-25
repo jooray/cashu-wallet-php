@@ -49,9 +49,57 @@ class CashuProtocolException extends CashuException
     public const MINT_SIGNATURE_INVALID = 20008;
     public const MINT_PUBKEY_REQUIRED = 20009;
 
-    public function __construct(string $message, ?int $code = null)
+    /** HTTP status of the reply that carried the error, when known. */
+    private ?int $httpStatus;
+
+    public function __construct(string $message, ?int $code = null, ?int $httpStatus = null)
     {
         parent::__construct($message, $code ?? 0);
+        $this->httpStatus = $httpStatus;
+    }
+
+    public function getHttpStatus(): ?int
+    {
+        return $this->httpStatus;
+    }
+
+    /**
+     * Whether the mint positively answered "no" to this request, as opposed to an
+     * ambiguous failure after which it may still have executed it.
+     *
+     * Definitive: a Cashu error code, or an HTTP 4xx other than 408/425/429. Ambiguous:
+     * 5xx (a gateway may have timed out while the mint kept going), and "pending" codes
+     * (11002, 20005), which say the operation is in flight. Transport failures are plain
+     * CashuExceptions and never definitive.
+     *
+     * A definitive rejection proves the *rejected request* did nothing; it does not prove
+     * an earlier attempt with the same data did nothing. Callers still confirm with
+     * NUT-07/NUT-09 before releasing or replacing anything.
+     */
+    public function isDefinitive(): bool
+    {
+        if (in_array($this->getCode(), [self::PROOFS_PENDING, self::QUOTE_PENDING], true)) {
+            return false;
+        }
+        $status = $this->httpStatus;
+        if ($status !== null) {
+            if ($status >= 500 || in_array($status, [408, 425, 429], true)) {
+                return false;
+            }
+            return $status >= 400;
+        }
+        return $this->getCode() > 0;
+    }
+
+    /** The mint does not know the quote (HTTP 404 or a "quote not found" rejection). */
+    public function isQuoteNotFound(): bool
+    {
+        if ($this->httpStatus === 404) {
+            return true;
+        }
+        return $this->isDefinitive()
+            && preg_match('/quote[^.]{0,40}(not found|does not exist|unknown)|unknown quote|no such quote/i',
+                $this->getMessage()) === 1;
     }
 }
 
@@ -3078,7 +3126,11 @@ class MintClient
                 $errorMsg = json_encode($errorMsg);
             }
             $errorCode = is_array($decoded) ? ($decoded['code'] ?? null) : null;
-            throw new CashuProtocolException($errorMsg, $errorCode);
+            throw new CashuProtocolException(
+                (string)$errorMsg,
+                is_int($errorCode) ? $errorCode : (is_numeric($errorCode) ? (int)$errorCode : null),
+                (int)$httpCode
+            );
         }
 
         // A 2xx that isn't valid JSON is also ambiguous (HTML error page, truncation).
@@ -4447,6 +4499,7 @@ class WalletStorage
             );
             $insert = $this->pdo->prepare("\n                INSERT INTO cashu_proofs\n                (wallet_id, keyset_id, amount, secret, C, dleq, state, mint_quote_id, created_at)\n                VALUES (?, ?, ?, ?, ?, ?, 'PENDING', NULL, ?)\n            ");
 
+            $imported = [];
             foreach ($proofs as $proof) {
                 $select->execute([$this->walletId, $proof->secret]);
                 $row = $select->fetch(\PDO::FETCH_ASSOC);
@@ -4468,6 +4521,7 @@ class WalletStorage
                         $this->walletId, $proof->id, $proof->amount, $proof->secret,
                         $proof->C, $dleq, time(),
                     ]);
+                    $imported[] = $proof->secret;
                 } else {
                     $update->execute([ProofState::PENDING, $this->walletId, $proof->secret]);
                 }
@@ -4483,6 +4537,12 @@ class WalletStorage
                 'amounts' => array_values($amounts),
                 'input_secrets' => $inputSecrets,
             ]);
+            if (!empty($imported)) {
+                // Inputs this operation brought in (a received token). If the mint
+                // definitively refuses them, they are removed again rather than left
+                // as junk rows (audit N6).
+                $data['imported_secrets'] = $imported;
+            }
             $this->savePendingOperation($id, $type, $data, $extraData['expires_at'] ?? null);
             $this->commitImmediate($savepoint);
             return $data;
@@ -4532,6 +4592,113 @@ class WalletStorage
             $this->updateProofsState($inputSecrets, $inputState);
             $this->deletePendingOperation($id);
             $this->commitWrite($savepoint);
+        } catch (\Throwable $e) {
+            $this->rollbackWrite($savepoint);
+            throw $e;
+        }
+    }
+
+    /**
+     * Terminally settle a swap/melt journal whose inputs end in different ways, in one
+     * transaction: each input secret maps to SPENT, UNSPENT (released) or null (row
+     * deleted — only for inputs the operation itself imported). Outputs, if any, are
+     * stored. The same ownership checks as finalizePendingSpend() apply.
+     *
+     * @param array<string, ?string> $outcome secret => ProofState::SPENT|ProofState::UNSPENT|null
+     * @param Proof[] $outputProofs
+     */
+    public function settlePendingSpend(string $id, array $inputSecrets, array $outcome, array $outputProofs = []): void
+    {
+        $savepoint = $this->beginWrite();
+        try {
+            $operation = $this->getPendingOperationById($id);
+            if ($operation === null) {
+                $this->commitWrite($savepoint);
+                return;
+            }
+            $imported = array_flip($operation['data']['imported_secrets'] ?? []);
+            if (!in_array($operation['type'], ['swap', 'melt'], true)
+                || ($operation['data']['input_secrets'] ?? null) !== $inputSecrets
+                || count($outcome) !== count($inputSecrets)) {
+                throw new CashuException('Settlement does not match the pending spend');
+            }
+            $states = $this->getProofsStatesBySecrets($inputSecrets);
+            foreach ($inputSecrets as $secret) {
+                if (!array_key_exists($secret, $outcome)
+                    || !in_array($outcome[$secret], [ProofState::SPENT, ProofState::UNSPENT, null], true)
+                    || ($outcome[$secret] === null && !isset($imported[$secret]))) {
+                    throw new CashuException('Settlement does not match the pending spend');
+                }
+                if (($states[$secret] ?? null) !== ProofState::PENDING) {
+                    throw new CashuException('Pending spend no longer owns a reserved input');
+                }
+            }
+            foreach ($this->getPendingOperations() as $other) {
+                if ($other['id'] !== $id
+                    && array_intersect($inputSecrets, $other['data']['input_secrets'] ?? [])) {
+                    throw new CashuException('Input is claimed by another pending operation');
+                }
+            }
+            if (!empty($outputProofs)) {
+                $this->storeProofs($outputProofs);
+            }
+            $groups = [ProofState::SPENT => [], ProofState::UNSPENT => []];
+            $delete = [];
+            foreach ($outcome as $secret => $state) {
+                if ($state === null) {
+                    $delete[] = (string)$secret;
+                } else {
+                    $groups[$state][] = (string)$secret;
+                }
+            }
+            foreach ($groups as $state => $secrets) {
+                $this->updateProofsState($secrets, $state);
+            }
+            $this->deleteProofs($delete);
+            $this->deletePendingOperation($id);
+            $this->commitWrite($savepoint);
+        } catch (\Throwable $e) {
+            $this->rollbackWrite($savepoint);
+            throw $e;
+        }
+    }
+
+    /**
+     * Atomically replace a mint journal's output plan with a fresh counter range (audit
+     * L-4). Only the exact plan the caller verified as rejected is replaced, so two
+     * workers cannot both replace it or resurrect an older plan; the old counters stay
+     * burned.
+     *
+     * @return array The new plan
+     */
+    public function replacePendingMintPlan(string $quoteId, array $rejectedPlan, string $keysetId, array $amounts): array
+    {
+        $id = 'mint:' . $quoteId;
+        $savepoint = $this->beginWrite();
+        try {
+            $existing = $this->getPendingOperationById($id);
+            if ($existing === null || $existing['type'] !== 'mint' || $existing['data'] !== $rejectedPlan) {
+                throw new CashuException('Mint plan changed concurrently; not replacing it');
+            }
+            $counterStart = $this->getCounter($keysetId);
+            $this->setCounter($keysetId, $counterStart + count($amounts));
+            $replaced = $rejectedPlan['replaced_plans'] ?? [];
+            $replaced[] = [
+                'keyset_id' => $rejectedPlan['keyset_id'],
+                'counter_start' => $rejectedPlan['counter_start'],
+                'count' => count($rejectedPlan['amounts'] ?? []),
+                'at' => time(),
+            ];
+            $plan = [
+                'counter_start' => $counterStart,
+                'keyset_id' => $keysetId,
+                'amounts' => array_values($amounts),
+                'input_secrets' => [],
+                'replaced_plans' => $replaced,
+            ];
+            $this->savePendingOperation($id, 'mint', $plan, $existing['expires_at'] === null ? null : (int)$existing['expires_at']);
+            $this->commitWrite($savepoint);
+            return $plan;
         } catch (\Throwable $e) {
             $this->rollbackWrite($savepoint);
             throw $e;
@@ -5107,6 +5274,10 @@ class Wallet
      * - PAID: Mark input proofs as SPENT, recover change proofs, delete pending op
      * - UNPAID + expired: Mark input proofs as UNSPENT, delete pending op
      * - PENDING or UNPAID + not expired: Keep as-is for next check
+     * - UNPAID without expiry: released like an expired one once the journal is older
+     *   than MELT_RELEASE_AFTER and the mint confirms the inputs UNSPENT
+     * - Quote unknown to the mint (`unknown_quote`): inputs UNSPENT → restored; SPENT →
+     *   change via NUT-09, then paid; otherwise kept
      *
      * @return array{
      *   checked: int,
@@ -5114,6 +5285,7 @@ class Wallet
      *   restored: int,
      *   still_pending: int,
      *   change_recovered: int,
+     *   unknown_quote: int,
      *   errors: array<string, string>
      * }
      */
@@ -5125,6 +5297,7 @@ class Wallet
             'restored' => 0,
             'still_pending' => 0,
             'change_recovered' => 0,
+            'unknown_quote' => 0,
             'errors' => [],
         ];
 
@@ -5152,7 +5325,25 @@ class Wallet
 
             try {
                 // Check quote status with mint
-                $quote = $this->checkMeltQuote($quoteId);
+                try {
+                    $quote = $this->checkMeltQuote($quoteId);
+                } catch (CashuProtocolException $e) {
+                    if (!$e->isQuoteNotFound()) {
+                        throw $e;
+                    }
+                    // The mint forgot the quote. Our inputs tell us what happened.
+                    $result['unknown_quote']++;
+                    $settled = $this->settleMeltWithoutQuote($pendingId, $op['data']);
+                    if ($settled === null) {
+                        $result['still_pending']++;
+                    } elseif ($settled['paid']) {
+                        $result['paid']++;
+                        $result['change_recovered'] += $settled['change'];
+                    } else {
+                        $result['restored']++;
+                    }
+                    continue;
+                }
                 if ($quote->quote !== $quoteId) {
                     throw new CashuException('Mint returned a quote for a different ID');
                 }
@@ -5177,7 +5368,11 @@ class Wallet
                 } elseif ($state === 'UNPAID') {
                     // Check if quote has expired
                     $now = time();
-                    $expired = $quote->expiry !== null && $quote->expiry < $now;
+                    // A quote without an expiry never "expires"; once our melt request
+                    // can no longer be in flight, the inputs' state decides instead.
+                    $expired = $quote->expiry !== null
+                        ? $quote->expiry < $now
+                        : (int)($op['created_at'] ?? $now) < $now - self::MELT_RELEASE_AFTER;
 
                     if ($expired && $this->inputsConfirmedUnspent($op['data']['input_secrets'] ?? [])) {
                         // An expired unpaid quote is necessary but not sufficient to hand
@@ -5204,6 +5399,38 @@ class Wallet
         }
 
         return $result;
+    }
+
+    /**
+     * Seconds after which a melt journal on an UNPAID quote without expiry may release
+     * its inputs (after the mint confirms them UNSPENT). Well past melt()'s 120 s request.
+     */
+    public const MELT_RELEASE_AFTER = 600;
+
+    /**
+     * Settle a melt journal whose quote the mint no longer knows: inputs all UNSPENT →
+     * released; all SPENT → the melt ran, so collect change via NUT-09 and mark them
+     * SPENT. Anything else (mixed, PENDING, unreadable) returns null and keeps it.
+     *
+     * @return array{paid: bool, change: int}|null
+     */
+    private function settleMeltWithoutQuote(string $pendingId, array $data): ?array
+    {
+        $secrets = $data['input_secrets'] ?? [];
+        if (empty($secrets)) {
+            return null;
+        }
+        $states = array_values(array_unique($this->inputStatesBySecret($secrets)));
+        if ($states === [ProofState::UNSPENT]) {
+            $this->storage->finalizePendingSpend($pendingId, $secrets, ProofState::UNSPENT);
+            return ['paid' => false, 'change' => 0];
+        }
+        if ($states === [ProofState::SPENT]) {
+            $change = empty($data['amounts']) ? [] : $this->recoverPendingOutputs($data, false);
+            $this->storage->finalizePendingSpend($pendingId, $secrets, ProofState::SPENT, $change);
+            return ['paid' => true, 'change' => self::sumProofs($change)];
+        }
+        return null;
     }
 
     /**
@@ -5332,11 +5559,17 @@ class Wallet
      * Anything else (still payable, unreachable, an answer we do not understand) is left
      * alone: a journal is cheap, and deleting one that still owns money is not.
      *
-     * @return array{checked:int, recovered:int, amount:int, retired:int, still_pending:int, errors:array}
+     * Also: a quote the mint reports PAID but not issued is minted now (replacing a
+     * definitively rejected plan, L-4), and a journal whose quote the mint no longer
+     * knows is retired once NUT-09 confirms none of its outputs were signed
+     * (`unknown_quote`, also counted in `retired`).
+     *
+     * @return array{checked:int, recovered:int, amount:int, retired:int, unknown_quote:int, still_pending:int, errors:array}
      */
     public function recoverPendingMints(): array
     {
-        $result = ['checked' => 0, 'recovered' => 0, 'amount' => 0, 'retired' => 0, 'still_pending' => 0, 'errors' => []];
+        $result = ['checked' => 0, 'recovered' => 0, 'amount' => 0, 'retired' => 0, 'unknown_quote' => 0,
+            'still_pending' => 0, 'errors' => []];
         if (!$this->storage) {
             return $result;
         }
@@ -5362,9 +5595,41 @@ class Wallet
                     continue;
                 }
 
-                $quote = $this->checkMintQuote($quoteId);
+                try {
+                    $quote = $this->checkMintQuote($quoteId);
+                } catch (CashuProtocolException $e) {
+                    if (!$e->isQuoteNotFound()) {
+                        throw $e;
+                    }
+                    // The mint no longer knows the quote, so it cannot issue on it. Our
+                    // outputs could only exist if it issued before forgetting: ask.
+                    $proofs = $this->recoverPendingOutputs($op['data']);
+                    if (empty($proofs)) {
+                        $this->storage->deletePendingOperation($id);
+                        $this->storage->deleteMintQuoteKey($quoteId);
+                        $result['retired']++;
+                        $result['unknown_quote']++;
+                    } elseif (count($proofs) === count($op['data']['amounts'] ?? [])) {
+                        $this->storage->finalizePendingMint($quoteId, $op['data'], $proofs);
+                        $result['recovered']++;
+                        $result['amount'] += self::sumProofs($proofs);
+                    } else {
+                        $result['still_pending']++;
+                    }
+                    continue;
+                }
                 if ($quote->quote !== $quoteId) {
                     throw new CashuException('Mint returned a quote for a different ID');
+                }
+
+                if ($quote->isPaid() && !$quote->isIssued() && !$this->requiresRecovery()) {
+                    // Paid but never issued: finish the mint. mint() reuses the recorded
+                    // plan and replaces it only after a definitive rejection (L-4).
+                    $amount = array_sum($op['data']['amounts'] ?? []);
+                    $proofs = $this->mint($quoteId, $amount);
+                    $result['recovered']++;
+                    $result['amount'] += self::sumProofs($proofs);
+                    continue;
                 }
 
                 if ($quote->isIssued()) {
@@ -5399,10 +5664,30 @@ class Wallet
         return $result;
     }
 
-    /** Recover or release swaps left ambiguous by a crash or timeout. */
+    /**
+     * Bring every swap journal to a terminal state where the mint's answers allow it
+     * (audit L-2, N6, N19).
+     *
+     * - Inputs SPENT and the recorded outputs signed (NUT-09): the swap happened; store
+     *   the outputs (`recovered`).
+     * - Inputs UNSPENT, nothing signed: resubmit the recorded plan. If the mint
+     *   definitively rejects it, release the inputs; the plan's counters stay burned
+     *   (`released`).
+     * - Some or all inputs SPENT but none of our outputs signed: a swap is atomic, so
+     *   someone else spent those inputs (typically a received token the sender
+     *   double-spent). SPENT inputs are marked SPENT, UNSPENT ones released
+     *   (`double_spent`).
+     * - Anything else — inputs PENDING at the mint, an unreadable or partial answer, a
+     *   transport error, some outputs signed: the journal is kept (`still_pending` /
+     *   `errors`). Nothing the mint reports SPENT is ever made UNSPENT.
+     *
+     * @return array{checked: int, recovered: int, released: int, double_spent: int,
+     *               still_pending: int, errors: array<string, string>}
+     */
     public function recoverPendingSwaps(): array
     {
-        $result = ['checked' => 0, 'recovered' => 0, 'released' => 0, 'still_pending' => 0, 'errors' => []];
+        $result = ['checked' => 0, 'recovered' => 0, 'released' => 0, 'double_spent' => 0,
+            'still_pending' => 0, 'errors' => []];
         if (!$this->storage) {
             return $result;
         }
@@ -5410,41 +5695,108 @@ class Wallet
         foreach ($this->storage->getPendingOperations('swap') as $op) {
             $result['checked']++;
             try {
-                $data = $op['data'];
-                $secrets = $data['input_secrets'] ?? [];
-                $Ys = [];
-                foreach ($secrets as $secret) {
-                    $Ys[] = bin2hex(Secp256k1::compressPoint(Crypto::hashToCurve($secret)));
-                }
-                $response = $this->client->post('checkstate', ['Ys' => $Ys]);
-                $states = array_map(
-                    fn($state) => strtoupper($state['state'] ?? ''),
-                    $response['states'] ?? []
-                );
-                if (count($states) !== count($secrets)) {
-                    throw new CashuException('Mint returned incomplete input state response');
-                }
-
-                if (!empty($states) && count(array_filter($states, fn($state) => $state === ProofState::SPENT)) === count($states)) {
-                    $proofs = $this->recoverPendingOutputs($data);
-                    if (count($proofs) !== count($data['amounts'] ?? [])) {
-                        $result['still_pending']++;
-                        continue;
+                $outcome = $this->resolveSwapJournal($op['id'], $op['data'], false, false);
+                if ($outcome['outcome'] === 'resubmit') {
+                    $proofs = $this->storage->getProofsBySecretsAsObjects($op['data']['input_secrets'] ?? []);
+                    try {
+                        $this->submitPreparedSwap($op['id'], $proofs, $op['data']);
+                        $outcome = ['outcome' => 'recovered'];
+                    } catch (CashuException $e) {
+                        if (!self::isDefinitiveRejection($e)) {
+                            throw $e;
+                        }
+                        $outcome = $this->resolveSwapJournal($op['id'], $op['data'], true, false);
+                        if ($outcome['outcome'] === 'still_pending') {
+                            $result['errors'][$op['id']] = $e->getMessage();
+                        }
                     }
-                    $this->storage->finalizePendingSpend($op['id'], $secrets, ProofState::SPENT, $proofs);
-                    $result['recovered']++;
-                } elseif (!empty($states) && count(array_filter($states, fn($state) => $state === ProofState::UNSPENT)) === count($states)) {
-                    $proofs = $this->storage->getProofsBySecretsAsObjects($secrets);
-                    $this->submitPreparedSwap($op['id'], $proofs, $data);
-                    $result['recovered']++;
-                } else {
-                    $result['still_pending']++;
                 }
+                $result[$outcome['outcome'] === 'resubmit' ? 'still_pending' : $outcome['outcome']]++;
             } catch (\Throwable $e) {
                 $result['errors'][$op['id']] = $e->getMessage();
             }
         }
         return $result;
+    }
+
+    /** Only a definitive protocol rejection may release or replace a journal's plan. */
+    private static function isDefinitiveRejection(\Throwable $e): bool
+    {
+        return $e instanceof CashuProtocolException && $e->isDefinitive();
+    }
+
+    /**
+     * NUT-07 states of stored input secrets, matched by Y.
+     *
+     * @param string[] $secrets
+     * @return array<string, string> secret => state
+     */
+    private function inputStatesBySecret(array $secrets): array
+    {
+        $Ys = [];
+        foreach ($secrets as $secret) {
+            $Ys[$secret] = bin2hex(Secp256k1::compressPoint(Crypto::hashToCurve($secret)));
+        }
+        $states = $this->fetchStatesByY(array_values($Ys));
+        $result = [];
+        foreach ($Ys as $secret => $Y) {
+            $result[(string)$secret] = $states[$Y] ?? '';
+        }
+        return $result;
+    }
+
+    /**
+     * Decide a swap journal from the mint's authoritative answers (see
+     * recoverPendingSwaps()). $rejected: the recorded plan was just definitively
+     * rejected. $direct: the caller of swap()/receive() is present and gets an
+     * exception, so inputs this journal imported are removed instead of released.
+     *
+     * @return array{outcome: string, proofs?: Proof[]} outcome: recovered, released,
+     *         double_spent, resubmit or still_pending
+     * @throws CashuException when the mint's answers are unreadable (journal kept)
+     */
+    private function resolveSwapJournal(string $id, array $data, bool $rejected, bool $direct): array
+    {
+        $secrets = $data['input_secrets'] ?? [];
+        if (empty($secrets)) {
+            return ['outcome' => 'still_pending'];
+        }
+        $states = $this->inputStatesBySecret($secrets);
+        foreach ($states as $state) {
+            if ($state !== ProofState::SPENT && $state !== ProofState::UNSPENT) {
+                // PENDING at the mint: an operation on these inputs is in flight.
+                return ['outcome' => 'still_pending'];
+            }
+        }
+        $proofs = $this->recoverPendingOutputs($data);
+        $spent = count(array_filter($states, fn($state) => $state === ProofState::SPENT));
+
+        if ($spent === count($states) && count($proofs) === count($data['amounts'] ?? []) && !empty($proofs)) {
+            $this->storage->finalizePendingSpend($id, $secrets, ProofState::SPENT, $proofs);
+            return ['outcome' => 'recovered', 'proofs' => $proofs];
+        }
+        if (!empty($proofs)) {
+            // Some of our outputs are signed but not all, or inputs are not all spent:
+            // not a state a swap can reach. Keep everything for inspection.
+            return ['outcome' => 'still_pending'];
+        }
+        if ($spent === 0 && !$rejected) {
+            return ['outcome' => 'resubmit'];
+        }
+
+        // Nothing of ours was signed and the mint says the swap cannot happen (it
+        // rejected the plan, or some inputs are already spent by someone else).
+        $imported = array_flip($data['imported_secrets'] ?? []);
+        $outcome = [];
+        foreach ($states as $secret => $state) {
+            if ($direct && isset($imported[$secret])) {
+                $outcome[$secret] = null;
+            } else {
+                $outcome[$secret] = $state === ProofState::SPENT ? ProofState::SPENT : ProofState::UNSPENT;
+            }
+        }
+        $this->storage->settlePendingSpend($id, $secrets, $outcome);
+        return ['outcome' => $spent > 0 ? 'double_spent' : 'released'];
     }
 
     /** @return Proof[] */
@@ -6116,6 +6468,53 @@ class Wallet
         return MintQuote::fromArray($response);
     }
 
+    /** Guards replanRejectedMint() against recursing more than once. */
+    private bool $mintReplanning = false;
+
+    /**
+     * A paid, not issued quote whose recorded plan the mint definitively rejected (for
+     * example because its keyset rotated out): unless the mint signed any of the plan's
+     * outputs, replace the plan with fresh counters on the current active keyset and
+     * try once more (audit L-4). The replacement is atomic and only replaces the exact
+     * rejected plan, so there is never more than one live plan; the old counters stay
+     * burned. A rejected request did nothing, so a NUT-19 cached replay of it cannot
+     * issue anything either.
+     *
+     * @return Proof[]
+     */
+    private function replanRejectedMint(string $quoteId, int $amount, array $plan, CashuException $rejection): array
+    {
+        try {
+            $signed = $this->recoverPendingOutputs($plan);
+        } catch (CashuException $restoreError) {
+            throw $rejection;
+        }
+        if (!empty($signed)) {
+            throw new CashuException(
+                'Mint rejected the mint request but signed some of its outputs; journal retained'
+            );
+        }
+        $keysetCodes = [
+            CashuProtocolException::KEYSET_UNKNOWN,
+            CashuProtocolException::KEYSET_INACTIVE,
+            CashuProtocolException::KEYSET_EXPIRED,
+        ];
+        if (in_array($rejection->getCode(), $keysetCodes, true)) {
+            try {
+                $this->loadMint();
+            } catch (CashuException $reloadError) {
+                throw $rejection;
+            }
+        }
+        $this->storage->replacePendingMintPlan($quoteId, $plan, $this->getActiveKeysetId(), self::splitAmount($amount));
+        $this->mintReplanning = true;
+        try {
+            return $this->mint($quoteId, $amount);
+        } finally {
+            $this->mintReplanning = false;
+        }
+    }
+
     /**
      * Mint tokens after quote is paid
      *
@@ -6165,16 +6564,27 @@ class Wallet
         try {
             $response = $this->submitMintRequest($quoteId, $outputs);
         } catch (CashuException $e) {
-            $quote = $this->checkMintQuote($quoteId);
-            if ($quote->quote !== $quoteId || !$quote->isIssued()) {
+            try {
+                $quote = $this->checkMintQuote($quoteId);
+            } catch (CashuException $quoteError) {
                 throw $e;
             }
-            $proofs = $this->recoverPendingOutputs($plan);
-            if (count($proofs) !== count($outputs)) {
-                throw new CashuException('Issued mint recovery is incomplete; journal retained');
+            if ($quote->quote !== $quoteId) {
+                throw $e;
             }
-            $this->storage->finalizePendingMint($quoteId, $plan, $proofs);
-            return $proofs;
+            if ($quote->isIssued()) {
+                $proofs = $this->recoverPendingOutputs($plan);
+                if (count($proofs) !== count($outputs)) {
+                    throw new CashuException('Issued mint recovery is incomplete; journal retained');
+                }
+                $this->storage->finalizePendingMint($quoteId, $plan, $proofs);
+                return $proofs;
+            }
+            if ($quote->isPaid() && !$this->mintReplanning && self::isDefinitiveRejection($e)
+                && !($e instanceof CashuProtocolException && self::isMintSignatureError($e))) {
+                return $this->replanRejectedMint($quoteId, $amount, $plan, $e);
+            }
+            throw $e;
         }
 
         // Guard: the mint must return exactly one signature per output. A short/empty set
@@ -6276,9 +6686,14 @@ class Wallet
                 "Melt quote is denominated in {$quote->unit}, not {$this->unit}"
             );
         }
-        $totalNeeded = $quote->amount + $quote->feeReserve;
+        // NUT-02: the inputs' own fee is due on top of amount + fee reserve (L-8). A melt
+        // short of it is rejected only after the inputs were reserved.
+        $inputFee = $this->calculateFee($proofs);
+        $totalNeeded = $quote->amount + $quote->feeReserve + $inputFee;
         if ($proofsSum < $totalNeeded) {
-            throw new CashuException('Insufficient inputs for melt quote amount and fee reserve');
+            throw new CashuException(
+                "Insufficient inputs for melt quote amount, fee reserve and input fee ($inputFee)"
+            );
         }
 
         // NUT-08: the mint returns the unused part of the fee reserve (plus any input
@@ -6286,7 +6701,7 @@ class Wallet
         // into powers of two and signs at most as many outputs as we supplied, dropping
         // the rest — so the wallet must supply enough blank outputs to represent the
         // largest change it could possibly receive, and set every amount to 0.
-        $maxChange = $proofsSum - $quote->amount;
+        $maxChange = $proofsSum - $quote->amount - $inputFee;
         $blankCount = self::blankOutputCount($maxChange);
 
         $pendingId = "melt:$quoteId";
@@ -6358,7 +6773,18 @@ class Wallet
                 // Preserve the original operation error when reconciliation fails.
                 throw $meltError;
             }
-            if ($reconciled->quote !== $quoteId || !($reconciled->isPaid() || $reconciled->isPending())) {
+            if ($reconciled->quote !== $quoteId) {
+                throw $meltError;
+            }
+            if ($reconciled->isUnpaid() && self::isDefinitiveRejection($meltError)
+                && $this->inputsConfirmedUnspent($inputSecrets)) {
+                // The mint refused the melt, the quote is still unpaid and every input
+                // is unspent: nothing is in flight. Hand the inputs back now instead of
+                // at quote expiry (or never, without one) (L-8).
+                $this->storage->finalizePendingSpend($pendingId, $inputSecrets, ProofState::UNSPENT);
+                throw $meltError;
+            }
+            if (!($reconciled->isPaid() || $reconciled->isPending())) {
                 throw $meltError;
             }
             $reconciledQuote = $reconciled;
@@ -6508,7 +6934,27 @@ class Wallet
             throw new CashuException('Pending swap outputs do not match requested amounts');
         }
 
-        return $this->submitPreparedSwap($pendingId, $proofs, $pendingData);
+        try {
+            return $this->submitPreparedSwap($pendingId, $proofs, $pendingData);
+        } catch (CashuException $e) {
+            if (!self::isDefinitiveRejection($e)) {
+                // Timeout, 5xx, garbled reply: the mint may have executed the swap.
+                // The journal stays for recoverPendingSwaps().
+                throw $e;
+            }
+            // The mint refused. Settle now instead of leaving a permanent journal and
+            // PENDING rows: a replayed swap that already succeeded is recovered, a
+            // double-spent token is recorded, a refused plan releases the inputs.
+            try {
+                $outcome = $this->resolveSwapJournal($pendingId, $pendingData, true, true);
+            } catch (\Throwable $ignored) {
+                throw $e;
+            }
+            if ($outcome['outcome'] === 'recovered') {
+                return $outcome['proofs'];
+            }
+            throw $e;
+        }
     }
 
     /**

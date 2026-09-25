@@ -60,6 +60,15 @@ final class FakeRestoreMint extends MintClient
         if ($path === 'keysets') {
             return ['keysets' => $this->keysets];
         }
+        if ($path === 'info') {
+            return ['name' => 'fake', 'nuts' => []];
+        }
+        if ($path === 'keys') {
+            return ['keysets' => array_map(
+                fn($keyset) => ['id' => $keyset['id'], 'unit' => $keyset['unit'] ?? 'sat', 'keys' => self::keys()],
+                array_values(array_filter($this->keysets, fn($keyset) => $keyset['active'] ?? true))
+            )];
+        }
         if (str_starts_with($path, 'keys/')) {
             $id = urldecode(substr($path, 5));
             foreach ($this->keysets as $keyset) {
@@ -89,6 +98,25 @@ final class FakeRestoreMint extends MintClient
             'checkstate' => $this->checkstate($data['Ys']),
             default => throw new CashuException("Unexpected POST $path"),
         };
+    }
+
+    /** Sign outputs as the mint would for mint/swap (and remember them for NUT-09). */
+    public function signOutputs(array $outputs): array
+    {
+        $signatures = [];
+        foreach ($outputs as $output) {
+            $this->signed[strtolower($output['B_'])] = ['amount' => $output['amount'], 'id' => $output['id']];
+            $signatures[] = ['id' => $output['id'], 'amount' => $output['amount'], 'C_' => $output['B_']];
+        }
+        return ['signatures' => $signatures];
+    }
+
+    /** Mark proofs (by secret) with a NUT-07 state. */
+    public function setState(array $secrets, string $state): void
+    {
+        foreach ($secrets as $secret) {
+            $this->states[self::y($secret)] = $state;
+        }
     }
 
     public function restore(array $outputs): array

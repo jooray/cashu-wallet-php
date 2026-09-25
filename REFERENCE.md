@@ -43,13 +43,23 @@ Protocol error returned from the mint.
 ```php
 class CashuProtocolException extends CashuException
 {
-    public function __construct(string $message, ?int $code = null);
+    public function __construct(string $message, ?int $code = null, ?int $httpStatus = null);
+    public function getHttpStatus(): ?int;
+    public function isDefinitive(): bool;
+    public function isQuoteNotFound(): bool;
 }
 ```
 
 **Properties:**
 - `getMessage()`: Error description from mint
-- `getCode()`: Cashu protocol error code (if provided)
+- `getCode()`: Cashu protocol error code (if provided, else 0)
+- `getHttpStatus()`: HTTP status of the error reply (set by `MintClient`)
+- `isDefinitive()`: the mint positively refused this request — a Cashu error code or an
+  HTTP 4xx other than 408/425/429. 5xx replies and the "pending" codes 11002/20005 are
+  ambiguous (the operation may still run), as are plain `CashuException` transport
+  failures. Only definitive rejections ever release inputs or replace a mint plan, and
+  even then only after NUT-07/NUT-09 confirm nothing was executed.
+- `isQuoteNotFound()`: HTTP 404, or a definitive "quote not found / unknown quote" reply.
 
 ### InsufficientBalanceException
 
@@ -344,7 +354,7 @@ Melt tokens to pay a Lightning invoice.
 
 **Parameters:**
 - `$quoteId`: Quote ID from `requestMeltQuote()`
-- `$proofs`: `Proof[]` to spend (must cover amount + fee reserve)
+- `$proofs`: `Proof[]` to spend (must cover amount + fee reserve + their NUT-02 input fee; `selectProofsWithFees($proofs, $amount + $feeReserve)` selects such a set)
 
 **Returns:** `array{paid: bool, pending: bool, preimage: ?string, change: Proof[], changeRecoveryPending: bool}`
 
@@ -353,6 +363,9 @@ Melt tokens to pay a Lightning invoice.
 - `pending=true`: Proofs stay PENDING (reserved) until `recoverPendingMelts()` resolves the quote
 - Both false: the inputs stay reserved (PENDING) under the melt journal until
   `recoverPendingMelts()` confirms the quote expired unpaid and the inputs unspent
+- Definitive rejection (e.g. payment failed) while the quote is still UNPAID and the
+  mint confirms every input UNSPENT: inputs released immediately, journal removed, the
+  `CashuProtocolException` rethrown
 
 **Lost response:** when the POST fails but the quote reports PAID, the change is recovered
 the same way `recoverPendingMelts()` does it: from the quote's `change`, or — because GET is
@@ -384,7 +397,7 @@ Recover pending melt operations by checking quote status with the mint.
 
 When `melt()` returns `pending: true`, the input proofs are marked PENDING. If the payment later completes or fails, this function will update the proof states accordingly and recover any change.
 
-**Returns:** `array{checked: int, paid: int, restored: int, still_pending: int, change_recovered: int, errors: array}`
+**Returns:** `array{checked: int, paid: int, restored: int, still_pending: int, change_recovered: int, unknown_quote: int, errors: array}`
 
 | Field | Description |
 |-------|-------------|
@@ -393,12 +406,67 @@ When `melt()` returns `pending: true`, the input proofs are marked PENDING. If t
 | `restored` | Melts that failed/expired (proofs restored to UNSPENT) |
 | `still_pending` | Melts still in progress |
 | `change_recovered` | Amount of recovered change (in unit) |
+| `unknown_quote` | Journals whose quote the mint no longer knows (also counted in `paid`/`restored`/`still_pending`) |
 | `errors` | Map of quoteId => error message |
 
 **Behavior by quote state:**
-- **PAID**: Mark input proofs as SPENT, recover change proofs, delete pending op
-- **UNPAID + expired**: Mark input proofs as UNSPENT (restoring funds), delete pending op
+- **PAID**: Mark input proofs as SPENT, recover change proofs (NUT-09 if the quote carries none), delete pending op
+- **UNPAID + expired**: Mark input proofs as UNSPENT (restoring funds) once the mint confirms them UNSPENT, delete pending op
+- **UNPAID without expiry**: same, once the journal is older than `Wallet::MELT_RELEASE_AFTER` (600 s)
+- **Quote unknown to the mint** (404 / "quote not found"): inputs all UNSPENT → released;
+  all SPENT → change recovered via NUT-09, inputs SPENT; mixed/PENDING → kept
 - **PENDING or UNPAID + not expired**: Keep as-is for next check
+- Ambiguous errors (timeouts, 5xx) never change anything.
+
+---
+
+#### recoverPendingSwaps()
+
+```php
+public function recoverPendingSwaps(): array
+```
+
+Bring swap journals (from `swap()`, `split()`, `receive()`) to a terminal state.
+
+**Returns:** `array{checked: int, recovered: int, released: int, double_spent: int, still_pending: int, errors: array}`
+
+| Mint's answer (NUT-07 inputs, NUT-09 outputs) | Result |
+|---|---|
+| inputs SPENT, all recorded outputs signed | outputs stored — `recovered` |
+| inputs UNSPENT, nothing signed | recorded plan resubmitted; if the mint definitively rejects it, inputs released (counters stay burned) — `released` |
+| some or all inputs SPENT, none of our outputs signed | someone else spent them (e.g. a double-spent received token): SPENT inputs marked SPENT, UNSPENT ones released — `double_spent` |
+| any input PENDING, some outputs signed, unreadable answer, transport error | journal kept — `still_pending` / `errors` |
+
+An input the mint reports SPENT is never made UNSPENT.
+
+`swap()`/`receive()` apply the same rules immediately when the mint definitively rejects
+the swap: inputs imported by that call (a received token) are removed again, own inputs
+released, and the original `CashuProtocolException` is rethrown — no journal or PENDING
+rows are left behind. If the rejection was a replay of a swap that had in fact succeeded,
+the recovered outputs are returned instead.
+
+---
+
+#### recoverPendingMints()
+
+```php
+public function recoverPendingMints(): array
+```
+
+**Returns:** `array{checked: int, recovered: int, amount: int, retired: int, unknown_quote: int, still_pending: int, errors: array}`
+
+- Quote ISSUED: outputs recovered via NUT-09 (`recovered`, `amount`).
+- Quote PAID but not issued: minted now via `mint()` (`recovered`, `amount`).
+- Quote expired unpaid: journal retired.
+- Quote unknown to the mint: retired (`unknown_quote`, also in `retired`) once NUT-09 shows
+  none of the plan's outputs were signed; stored if all were.
+
+`mint()` itself: when the mint definitively rejects the recorded output plan of a PAID,
+not issued quote (e.g. its keyset rotated out) and NUT-09 shows none of its outputs
+signed, the plan is atomically replaced with fresh counters on the current active keyset
+(keysets are reloaded after a keyset error) and the mint request retried once. The old
+counters stay burned. Transport errors, 5xx, NUT-20 signature errors and partially
+signed plans never replace a plan.
 
 **Example:**
 ```php
