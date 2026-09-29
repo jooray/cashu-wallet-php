@@ -4,6 +4,21 @@
 
 This library is in early experimental development. Features may be incomplete, bugs may exist, and **YOU MAY LOSE FUNDS**. Only use with amounts you can afford to lose. Not recommended for production use.
 
+<!-- jooray-links:start -->
+### More from me
+
+**Related projects**
+
+- [cashupayserver](https://github.com/jooray/cashupayserver): BTCPay-compatible Lightning payments through Cashu, on ordinary PHP hosting
+- [mint-discovery](https://github.com/jooray/mint-discovery): Cashu mint discovery library
+- [donation-sink](https://github.com/jooray/donation-sink): accept donations as Cashu tokens
+- [btcpay-greenfield-test](https://github.com/jooray/btcpay-greenfield-test): a minimal page for testing BTCPay Greenfield API integrations
+
+**Full project showcase:** Part of [CashuPayServer](https://juraj.bednar.io/showcase/#PAY-01) in my project showcase, or [all my projects](https://juraj.bednar.io/showcase/).
+
+I write about building things on [my blog](https://juraj.bednar.io/en/blog-en/). I also wrote a cypherpunk novel, [Tamers of Entropy](https://tamersofentropy.net/), and there is a [trailer](https://tamersofentropy.net/#trailer).
+<!-- jooray-links:end -->
+
 ## What is this?
 
 CashuWallet is a PHP implementation of the [Cashu protocol](https://github.com/cashubtc/nuts) - a Chaumian ecash system for Bitcoin. It allows you to:
