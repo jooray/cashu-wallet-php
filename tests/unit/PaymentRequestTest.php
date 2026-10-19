@@ -31,7 +31,8 @@ final class PaymentRequestTest extends TestCase
         $pr = PaymentRequest::parse($vector['encoded']);
 
         $this->assertSame($vector['id'], $pr->id);
-        $this->assertSame($vector['amount'], $pr->amount);
+        // No amount means "any amount" (NUT-18): null, not 0. The fixture writes 0.
+        $this->assertSame($vector['amount'] ?: null, $pr->amount);
         $this->assertSame($vector['unit'], $pr->unit);
         $this->assertSame($vector['mints'], $pr->mints);
 

@@ -55,7 +55,7 @@ class CashuProtocolException extends CashuException
 - `getCode()`: Cashu protocol error code (if provided, else 0)
 - `getHttpStatus()`: HTTP status of the error reply (set by `MintClient`)
 - `isDefinitive()`: the mint positively refused this request — a Cashu error code or an
-  HTTP 4xx other than 408/425/429. 5xx replies and the "pending" codes 11002/20005 are
+  HTTP 4xx other than 408/425/429. 5xx replies and the "pending" codes 11002/11004/20005 are
   ambiguous (the operation may still run), as are plain `CashuException` transport
   failures. Only definitive rejections ever release inputs or replace a mint plan, and
   even then only after NUT-07/NUT-09 confirm nothing was executed.
@@ -251,6 +251,10 @@ Request a mint quote (Lightning invoice to pay).
 
 **Returns:** `MintQuote` with invoice details.
 
+**Throws:** `CashuException` if the mint's quote is not for what was asked: an `amount`
+other than `$amount`, a `unit` other than the wallet's (case-insensitive), or — for `sat` —
+a BOLT11 `request` whose encoded amount differs. Fields the mint omits are not checked.
+
 **Example:**
 ```php
 $quote = $wallet->requestMintQuote(100);
@@ -285,7 +289,7 @@ if ($status->isPaid()) {
 #### mint()
 
 ```php
-public function mint(string $quoteId, int $amount): array
+public function mint(string $quoteId, int $amount, ?MintQuote $quote = null): array
 ```
 
 Mint tokens after quote is paid.
@@ -293,10 +297,13 @@ Mint tokens after quote is paid.
 **Parameters:**
 - `$quoteId`: Quote ID from `requestMintQuote()`
 - `$amount`: Amount to mint
+- `$quote`: The caller's latest `MintQuote`, if it has one. Without it the quote is looked
+  up first (best effort: a failed lookup does not stop the mint).
 
 **Returns:** `Proof[]` - Array of minted proofs.
 
-**Throws:** `CashuException` if no seed initialized.
+**Throws:** `CashuException` if no seed initialized, or if the quote's `unit` (when known)
+is not the wallet's unit — nothing is reserved in that case (mirrors `melt()`).
 
 **Example:**
 ```php
@@ -356,7 +363,7 @@ Melt tokens to pay a Lightning invoice.
 - `$quoteId`: Quote ID from `requestMeltQuote()`
 - `$proofs`: `Proof[]` to spend (must cover amount + fee reserve + their NUT-02 input fee; `selectProofsWithFees($proofs, $amount + $feeReserve)` selects such a set)
 
-**Returns:** `array{paid: bool, pending: bool, preimage: ?string, change: Proof[], changeRecoveryPending: bool}`
+**Returns:** `array{paid: bool, pending: bool, state: string, preimage: ?string, change: Proof[], changeRecoveryPending: bool, changeRecoveryError?: string}` — `state` is the mint's melt state (`PAID`, `PENDING`, `UNPAID`, or `UNKNOWN` when it sent none).
 
 **Proof State Behavior:**
 - `paid=true`: Proofs marked SPENT, change stored
@@ -397,7 +404,7 @@ Recover pending melt operations by checking quote status with the mint.
 
 When `melt()` returns `pending: true`, the input proofs are marked PENDING. If the payment later completes or fails, this function will update the proof states accordingly and recover any change.
 
-**Returns:** `array{checked: int, paid: int, restored: int, still_pending: int, change_recovered: int, unknown_quote: int, errors: array}`
+**Returns:** `array{checked: int, paid: int, restored: int, still_pending: int, change_recovered: int, unknown_quote: int, change_unrecoverable: int, errors: array, warnings: array}`
 
 | Field | Description |
 |-------|-------------|
@@ -407,10 +414,12 @@ When `melt()` returns `pending: true`, the input proofs are marked PENDING. If t
 | `still_pending` | Melts still in progress |
 | `change_recovered` | Amount of recovered change (in unit) |
 | `unknown_quote` | Journals whose quote the mint no longer knows (also counted in `paid`/`restored`/`still_pending`) |
-| `errors` | Map of quoteId => error message |
+| `change_unrecoverable` | PAID melts finalized although some change could never be unblinded (also in `paid`) |
+| `errors` | Map of quoteId => error message (journal kept, retried next run) |
+| `warnings` | Map of quoteId => message for terminal outcomes worth showing (lost change) |
 
 **Behavior by quote state:**
-- **PAID**: Mark input proofs as SPENT, recover change proofs (NUT-09 if the quote carries none), delete pending op
+- **PAID**: Mark input proofs as SPENT, recover change proofs (NUT-09 if the quote carries none, or if the quote's copy cannot be unblinded), delete pending op. Change signatures that can never be unblinded (wrong keyset, an amount without a key, a bad DLEQ) do not block this: the melt is finalized with the change that could be recovered and the rest is reported in `change_unrecoverable`/`warnings`. Transport errors still keep the journal.
 - **UNPAID + expired**: Mark input proofs as UNSPENT (restoring funds) once the mint confirms them UNSPENT, delete pending op
 - **UNPAID without expiry**: same, once the journal is older than `Wallet::MELT_RELEASE_AFTER` (600 s)
 - **Quote unknown to the mint** (404 / "quote not found"): inputs all UNSPENT → released;
@@ -428,16 +437,19 @@ public function recoverPendingSwaps(): array
 
 Bring swap journals (from `swap()`, `split()`, `receive()`) to a terminal state.
 
-**Returns:** `array{checked: int, recovered: int, released: int, double_spent: int, still_pending: int, errors: array}`
+**Returns:** `array{checked: int, recovered: int, released: int, double_spent: int, still_pending: int, aged_pending: int, orphaned: int, errors: array, warnings: array}`
 
 | Mint's answer (NUT-07 inputs, NUT-09 outputs) | Result |
 |---|---|
 | inputs SPENT, all recorded outputs signed | outputs stored — `recovered` |
-| inputs UNSPENT, nothing signed | recorded plan resubmitted; if the mint definitively rejects it, inputs released (counters stay burned) — `released` |
+| inputs UNSPENT, nothing signed | recorded plan resubmitted; if the mint definitively rejects it, inputs released and the plan's counters given back if nothing was allocated after them — `released` |
 | some or all inputs SPENT, none of our outputs signed | someone else spent them (e.g. a double-spent received token): SPENT inputs marked SPENT, UNSPENT ones released — `double_spent` |
 | any input PENDING, some outputs signed, unreadable answer, transport error | journal kept — `still_pending` / `errors` |
+| inputs PENDING at the mint for over `Wallet::SWAP_PENDING_WARN_AFTER` (1 h) | still kept, also counted in `aged_pending` with a `warnings` entry |
+| inputs no longer PENDING locally (someone overwrote them, e.g. with `updateProofsState()`) | journal cannot be finalized; `orphaned` + an `errors` entry naming the states; the mint is not asked |
 
-An input the mint reports SPENT is never made UNSPENT.
+An input the mint reports SPENT is never made UNSPENT. Released inputs go back to the state
+they were reserved from (see `swap()`'s `$reservableStates`).
 
 `swap()`/`receive()` apply the same rules immediately when the mint definitively rejects
 the swap: inputs imported by that call (a received token) are removed again, own inputs
@@ -457,7 +469,8 @@ public function recoverPendingMints(): array
 
 - Quote ISSUED: outputs recovered via NUT-09 (`recovered`, `amount`).
 - Quote PAID but not issued: minted now via `mint()` (`recovered`, `amount`).
-- Quote expired unpaid: journal retired.
+- Quote expired unpaid: NUT-09 first (the quote's accounting is not proof the mint signed
+  nothing): none of the plan signed → retired; all signed → stored (`recovered`); partial → kept.
 - Quote unknown to the mint: retired (`unknown_quote`, also in `retired`) once NUT-09 shows
   none of the plan's outputs were signed; stored if all were.
 
@@ -534,7 +547,7 @@ if ($result['paid']) {
 #### swap()
 
 ```php
-public function swap(array $proofs, array $amounts): array
+public function swap(array $proofs, array $amounts, array $reservableStates = [ProofState::UNSPENT]): array
 ```
 
 Swap proofs for new proofs with specified amounts.
@@ -542,6 +555,11 @@ Swap proofs for new proofs with specified amounts.
 **Parameters:**
 - `$proofs`: `Proof[]` input proofs
 - `$amounts`: `int[]` desired output amounts (must equal input - fee)
+- `$reservableStates`: local states the inputs may be reserved from (default `UNSPENT`).
+  Pass `[ProofState::EXPORTED]` to reclaim handed-out proofs: they move EXPORTED → PENDING
+  inside the journaled reservation (no unjournaled UNSPENT window), and a definitive
+  rejection returns them to EXPORTED (SPENT if the mint says they are spent). `PENDING`
+  and `SPENT` are never reservable.
 
 **Returns:** `Proof[]` new proofs.
 
@@ -636,8 +654,12 @@ Receive a token by swapping for fresh proofs.
 **Returns:** `Proof[]` new proofs owned by this wallet.
 
 **Throws:**
-- `CashuException` if token from different mint
+- `CashuException` if token from different mint (compared by canonical URL: case, default
+  port and duplicate slashes do not matter)
 - `CashuException` if amount <= fee
+- `CashuProtocolException` (11001 / 11002) if NUT-07 reports a proof already SPENT or
+  PENDING. This check runs before any output counter is reserved, so pasting spent tokens
+  cannot push real outputs past the restore gap.
 
 **Example:**
 ```php
@@ -689,12 +711,17 @@ $freshProofs = $wallet->receive($wallet->serializeToken($proofs));
 public function checkProofState(array $proofs): array
 ```
 
-Check the spent/pending state of proofs.
+Check the spent/pending state of proofs (NUT-07).
 
 **Parameters:**
 - `$proofs`: `Proof[]` to check
 
-**Returns:** Array of state objects with `'state'` key (`ProofState::UNSPENT`, `ProofState::SPENT`, `ProofState::PENDING`).
+**Returns:** `list<array{Y: string, state: string, witness: mixed}>` — one entry per input
+proof, **in input order** (so `$states[$i]` belongs to `$proofs[$i]`). The mint's answer is
+matched by `Y`, not position; a short, foreign or duplicated answer throws
+`CashuException`. `state` is upper-case; `ProofState::UNKNOWN` when the mint sent none —
+treat anything but `UNSPENT` as not spendable. Requests are chunked (100, or the mint's
+advertised `max_array_length` if lower).
 
 **Example:**
 ```php
@@ -1289,7 +1316,10 @@ or soon-expiring keysets (NUT-02 `final_expiry`) onto the active keyset,
 skipping inputs reserved by in-flight recovery.
 
 **NUT-19:** mint and swap requests are retried once with a byte-identical
-body on network-level failures when the mint advertises cached responses.
+body on network-level failures, and only when the mint lists that exact route in
+`nuts.19.cached_endpoints` (`POST /v1/swap`, `POST /v1/mint/bolt11`); NUT-19 has no
+`supported` flag. NUT-07/NUT-09 lists are sent in chunks of `Wallet::ARRAY_CHUNK` (100), or
+of the mint's advertised `max_array_length` when that is lower.
 Melt requests are deliberately not blindly replayed: after an ambiguous error,
 the wallet queries the authoritative melt-quote state and finalizes PAID or
 PENDING results. This remains safe with mints that advertise NUT-19 but have no
@@ -1584,8 +1614,13 @@ public function countProofsInState(string $state): int
 ```
 
 `forUnit()` returns the storage of another unit of the same mint and account sharing this
-connection (so one transaction can span both). `transitionProofStates()` moves only rows
-currently in one of `$from`, never secrets in `$exclude` (`secret => true`).
+connection (so one transaction can span both). `transitionProofStates()` is the
+compare-and-set for application-level state changes (export, donation, marking spent): it
+moves only rows currently in one of `$from`, never secrets in `$exclude` (`secret => true`,
+e.g. `array_flip($storage->getReservedInputSecrets())`), in one transaction, and returns the
+number of rows changed. A count below `count($secrets)` means another writer — usually a
+swap/melt journal that reserved a proof PENDING — got there first; do not hand that proof
+out.
 
 `beginRestoreSession()`, `setRestoreGap()`, `ensureRestoreKeyset()`, `recordRestoreError()`,
 `applyRestoreBatch()` and `finalizeRecovery()` are internal to `Wallet::restoreStep()`.
@@ -1688,7 +1723,9 @@ if (!empty($proofs)) {
 public function updateProofsState(array $secrets, string $state): void
 ```
 
-Update the state of proofs by their secrets.
+Update the state of proofs by their secrets. **Unconditional**: it overwrites any state,
+including PENDING inputs a journal owns (which leaves that journal unfinalizable). For
+application-level changes use `transitionProofStates()`.
 
 **Parameters:**
 - `$secrets`: Array of secret strings
@@ -2129,6 +2166,7 @@ that do not exist in the specification.)
 | 11001 | `PROOFS_ALREADY_SPENT` | Inputs are already spent |
 | 11002 | `PROOFS_PENDING` | Inputs are reserved by an in-flight operation |
 | 11003 | `OUTPUTS_ALREADY_SIGNED` | These outputs were signed before |
+| 11004 | `OUTPUTS_PENDING` | These outputs are part of an in-flight request (not definitive) |
 | 11005 | `TRANSACTION_UNBALANCED` | Inputs do not cover outputs plus fees |
 | 12001 | `KEYSET_UNKNOWN` | Unknown keyset |
 | 12002 | `KEYSET_INACTIVE` | Keyset is no longer active |

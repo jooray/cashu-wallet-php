@@ -97,20 +97,47 @@ final class PendingMintRecoveryTest extends TestCase
         ];
     }
 
-    /** A quote that expired without ever being paid owns nothing; retire the journal. */
+    /**
+     * A quote that expired unpaid is retired only once NUT-09 confirms the mint signed
+     * none of the plan (SPB-LIB-002): the quote's own accounting is not proof of that.
+     */
     public function testRetiresAJournalWhoseQuoteExpiredUnpaid(): void
     {
+        $restores = 0;
         $wallet = $this->wallet(
-            fn(string $path) => $this->quoteResponse('q-expired', 'UNPAID', time() - 86400)
+            fn(string $path) => $this->quoteResponse('q-expired', 'UNPAID', time() - 86400),
+            function (string $path, array $data) use (&$restores): array {
+                if ($path !== 'restore') {
+                    throw new CashuException("Unexpected POST: $path");
+                }
+                $restores++;
+                return ['outputs' => [], 'signatures' => []];
+            }
         );
         $this->journalMint($wallet, 'q-expired', [4, 4]);
 
         $result = $wallet->recoverPendingMints();
 
+        $this->assertSame(1, $restores, 'NUT-09 is asked before retiring');
         $this->assertSame(1, $result['checked']);
         $this->assertSame(1, $result['retired']);
         $this->assertSame(0, $result['recovered']);
         $this->assertNull($wallet->getStorage()->getPendingOperationById('mint:q-expired'));
+    }
+
+    /** If the restore cannot be asked, an expired-unpaid journal is kept. */
+    public function testKeepsAnExpiredUnpaidJournalWhenRestoreFails(): void
+    {
+        $wallet = $this->wallet(
+            fn(string $path) => $this->quoteResponse('q-expired', 'UNPAID', time() - 86400),
+            fn(string $path, array $data) => throw new CashuException('HTTP request failed: timeout')
+        );
+        $this->journalMint($wallet, 'q-expired', [4]);
+
+        $result = $wallet->recoverPendingMints();
+
+        $this->assertSame(0, $result['retired']);
+        $this->assertNotNull($wallet->getStorage()->getPendingOperationById('mint:q-expired'));
     }
 
     /** A quote still payable must keep its journal: the customer may yet pay. */

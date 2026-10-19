@@ -128,7 +128,7 @@ Recovery from seed is possible but slow. SQLite provides instant counter persist
 - ✅ SQLite persistence layer
 - ✅ Mint, melt, swap operations
 - ✅ Wallet restore from seed
-- ⚠️ NUT-18 payment requests (experimental, undocumented)
+- ✅ NUT-18 payment requests, in both encodings: `creqA` (CBOR) and `creqB` (NUT-26 Bech32m)
 
 ## Protocol Support
 
@@ -145,13 +145,14 @@ Implements these Cashu NUTs:
 - [NUT-09](https://github.com/cashubtc/nuts/blob/main/09.md) - Restore
 - [NUT-12](https://github.com/cashubtc/nuts/blob/main/12.md) - DLEQ proofs (verified on mint, swap, melt change and received tokens)
 - [NUT-13](https://github.com/cashubtc/nuts/blob/main/13.md) - Deterministic secrets (v1 BIP-32 + v2 HMAC)
-- [NUT-18](https://github.com/cashubtc/nuts/blob/main/18.md) - Payment requests (creation and parsing; paying one is not implemented)
+- [NUT-18](https://github.com/cashubtc/nuts/blob/main/18.md) - Payment requests (creation and parsing, all fields incl. `mp`, `sm`, `nut10`, multiple transports; paying one is not implemented)
+- [NUT-26](https://github.com/cashubtc/nuts/blob/main/26.md) - Payment requests in Bech32m (`PaymentRequest::serializeB()`; `parse()` reads both encodings). Byte-identical to cdk and cashu-ts on cdk's test vectors
 - [NUT-19](https://github.com/cashubtc/nuts/blob/main/19.md) - Cached responses
 - [NUT-20](https://github.com/cashubtc/nuts/blob/main/20.md) - Signature on mint quote
 - [NUT-23](https://github.com/cashubtc/nuts/blob/main/23.md) - BOLT11 payment method
 
 Not implemented: spending conditions (NUT-10/11/14), MPP (NUT-15), WebSockets (NUT-17),
-mint authentication (NUT-21/22), BOLT12 (NUT-25), bech32m payment requests (NUT-26),
+mint authentication (NUT-21/22), BOLT12 (NUT-25),
 P2BK (NUT-28), batched mint (NUT-29) and onchain (NUT-30). A mint requiring NUT-21/22
 authentication is not supported.
 

@@ -122,7 +122,7 @@ final class JournalTerminationTest extends TestCase
         $this->assertSame([], $wallet->getStorage()->getPendingOperations());
         $this->assertSame(0, $this->rowCount($wallet), 'no junk rows');
         $this->assertSame(0, $wallet->getBalance());
-        $this->assertGreaterThan(0, $wallet->getStorage()->getCounter(self::KS), 'counters stay burned');
+        $this->assertSame(0, $wallet->getStorage()->getCounter(self::KS), 'a refused token burns no counters');
         $this->assertSame(0, $wallet->recoverPendingSwaps()['checked']);
     }
 
@@ -214,14 +214,15 @@ final class JournalTerminationTest extends TestCase
         $this->assertNotEmpty($result['errors']);
         $this->assertCount(1, $wallet->getStorage()->getPendingOperations('swap'));
 
-        // Definitive refusal of the recorded plan: inputs come back, counters stay burned.
+        // Definitive refusal of the recorded plan: inputs come back, and so do the plan's
+        // counters, since nothing was allocated after them (SPB-LIB-001).
         $this->mint->onPost = fn(string $path) => $path === 'swap'
             ? throw self::rejection(CashuProtocolException::TRANSACTION_UNBALANCED) : null;
         $result = $wallet->recoverPendingSwaps();
         $this->assertSame(1, $result['released']);
         $this->assertSame([], $wallet->getStorage()->getPendingOperations());
         $this->assertSame(8, $wallet->getBalance());
-        $this->assertSame($counter, $wallet->getStorage()->getCounter(self::KS));
+        $this->assertSame($counter - 2, $wallet->getStorage()->getCounter(self::KS));
     }
 
     /** N19: mixed states never make a SPENT input spendable; PENDING keeps the journal. */
