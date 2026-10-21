@@ -177,6 +177,11 @@ class BigInt
             // (strpos() returns false, i.e. digit 0), so reject them here instead.
             throw new CashuException('Invalid hexadecimal integer');
         }
+        if (strlen($hex) > 130) {
+            // Backstop for the quadratic BCMath conversion: every legitimate value here
+            // is at most an uncompressed point (130 hex characters) (MINIMAX 4.4 / N1).
+            throw new CashuException('Hexadecimal integer is too long');
+        }
         $hex = ltrim($hex, '0') ?: '0';
 
         if (self::$useGmp) {
@@ -1184,13 +1189,19 @@ class Crypto
     public static function verifyDleq(mixed $e, mixed $s, string $A, string $B_, mixed $C_): bool
     {
         // e, s and C_ are mint-supplied; a wrong JSON type is an invalid proof, not a TypeError.
-        if (!is_string($e) || !is_string($s) || !is_string($C_)
-            || !ctype_xdigit($e) || !ctype_xdigit($s)) {
+        // e and s are 32-byte scalars. An unbounded string reached BigInt::fromHex(), which
+        // is quadratic on the BCMath backend, so one proof could cost minutes of CPU
+        // (MINIMAX 4.4). A value that is not 64 hex characters is not a valid scalar.
+        if (!self::isDleqScalar($e) || !self::isDleqScalar($s) || !is_string($C_)) {
             return false;
         }
         try {
-            $eScalar = BigInt::fromHex($e);
-            $sScalar = BigInt::fromHex($s);
+            // Some wallets omit leading zeroes; the scalar value is the same. Pad to the
+            // 32-byte width before parsing and comparing.
+            $eHex = str_pad($e, 64, '0', STR_PAD_LEFT);
+            $sHex = str_pad($s, 64, '0', STR_PAD_LEFT);
+            $eScalar = BigInt::fromHex($eHex);
+            $sScalar = BigInt::fromHex($sHex);
             $Apoint = Secp256k1::decompressPointHex($A);
             $Bpoint = Secp256k1::decompressPointHex($B_);
             $Cpoint = Secp256k1::decompressPointHex($C_);
@@ -1208,7 +1219,7 @@ class Crypto
                 return false;
             }
 
-            return hash_equals(self::hashE($R1, $R2, $Apoint, $Cpoint), strtolower($e));
+            return hash_equals(self::hashE($R1, $R2, $Apoint, $Cpoint), strtolower($eHex));
         } catch (\Throwable $error) {
             return false;
         }
@@ -1221,11 +1232,13 @@ class Crypto
      */
     public static function verifyProofDleq(Proof $proof, string $A): bool
     {
-        if ($proof->dleq === null || $proof->dleq->r === null || $proof->dleq->r === '') {
+        // The blinding factor is a 32-byte scalar. Without the exact-length check a
+        // 200 KB r reached the quadratic BCMath parser (MINIMAX 4.4 / N1).
+        if ($proof->dleq === null || !self::isDleqScalar($proof->dleq->r)) {
             return false;
         }
         try {
-            $r = BigInt::fromHex($proof->dleq->r);
+            $r = BigInt::fromHex(str_pad((string)$proof->dleq->r, 64, '0', STR_PAD_LEFT));
             $Apoint = Secp256k1::decompressPointHex($A);
             $Cpoint = Secp256k1::decompressPointHex($proof->C);
             $G = Secp256k1::getGenerator();
@@ -1246,6 +1259,18 @@ class Crypto
         } catch (\Throwable $error) {
             return false;
         }
+    }
+
+    /**
+     * A NUT-12 scalar: at most 32 bytes, written as hex.
+     *
+     * Leading zeroes may be omitted by some wallets, so anything from 1 to 64 hex
+     * characters is accepted (and padded before parsing). The upper bound is what keeps
+     * a huge value out of the quadratic BCMath parser.
+     */
+    private static function isDleqScalar(mixed $value): bool
+    {
+        return is_string($value) && $value !== '' && strlen($value) <= 64 && ctype_xdigit($value);
     }
 }
 
@@ -3096,6 +3121,9 @@ class CBOR
     /** Deepest nesting accepted while decoding; guards against stack exhaustion. */
     private const MAX_DEPTH = 16;
 
+    /** Most entries accepted in one map while decoding. */
+    private const MAX_MAP_ENTRIES = 64;
+
     private static function encodeUnsigned(int $value): string
     {
         return self::encodeHead(self::UNSIGNED_INT, $value);
@@ -3200,14 +3228,21 @@ class CBOR
                 return $result;
 
             case self::MAP:
+                // Token and payment-request maps have a handful of fields; a large map
+                // is only ever an attempt to make us build a huge array (N8).
+                if ($value > self::MAX_MAP_ENTRIES) {
+                    throw new CashuException('CBOR: Map has too many entries');
+                }
                 if ($value > intdiv(strlen($data) - $offset, 2)) {
                     throw new CashuException('CBOR: Map length exceeds the remaining data');
                 }
                 $result = [];
                 for ($i = 0; $i < $value; $i++) {
                     $key = self::decodeValue($data, $offset, $depth + 1);
-                    if (!is_string($key) && !is_int($key)) {
-                        throw new CashuException('CBOR: Map keys must be strings or integers');
+                    // Text keys only: the encoder writes nothing else, and an integer or
+                    // array key would collide with (or be coerced into) a string one.
+                    if (!is_string($key)) {
+                        throw new CashuException('CBOR: Map keys must be strings');
                     }
                     $result[$key] = self::decodeValue($data, $offset, $depth + 1);
                 }
@@ -3624,6 +3659,49 @@ class TokenSerializer
 /**
  * HTTP client for mint API
  */
+/**
+ * Optional address policy for the library's own outbound requests.
+ *
+ * Mint URLs arrive from tokens and payment requests, LNURL endpoints from whoever owns
+ * a Lightning address. The library cannot know which networks the host application
+ * considers off limits, so the application installs a guard that resolves the host,
+ * refuses what it must not reach and returns CURLOPT_RESOLVE pins, so libcurl connects
+ * to exactly the addresses that were checked (no DNS rebinding between check and use).
+ */
+final class ConnectGuard
+{
+    /** @var (callable(string $url, string $purpose): string[])|null */
+    private static $guard = null;
+
+    /** Install (or clear with null) an address policy for outbound wallet requests.
+     *  The callable gets the full URL and a purpose ('mint' | 'lnurl') and returns the
+     *  CURLOPT_RESOLVE entries to pin ("host:port:addr[,addr]"), or [] for no pin.
+     *  It throws to refuse the connection. */
+    public static function set(?callable $guard): void { self::$guard = $guard; }
+
+    /**
+     * @return array<int,mixed> extra curl options (CURLOPT_RESOLVE), [] when no guard
+     * @throws CashuException "Connection refused: ..." when the guard refuses the URL
+     */
+    public static function curlOptions(string $url, string $purpose): array
+    {
+        if (self::$guard === null) {
+            return [];
+        }
+        try {
+            $resolve = (self::$guard)($url, $purpose);
+        } catch (\Throwable $e) {
+            throw new CashuException('Connection refused: ' . $e->getMessage(), 0, $e);
+        }
+        if (!is_array($resolve)) {
+            throw new CashuException('Connection refused: address policy returned no pin list');
+        }
+        $resolve = array_values(array_filter($resolve, fn($entry) => is_string($entry) && $entry !== ''));
+
+        return $resolve === [] ? [] : [CURLOPT_RESOLVE => $resolve];
+    }
+}
+
 class MintClient
 {
     /** Largest mint response body accepted. */
@@ -3725,6 +3803,8 @@ class MintClient
     private function request(string $method, string $path, ?array $data = null, ?int $timeout = null): array
     {
         $url = $this->mintUrl . '/v1/' . ltrim($path, '/');
+        // Before curl_init: a refused address never opens a handle.
+        $guardOptions = ConnectGuard::curlOptions($url, 'mint');
 
         $response = '';
         $tooLarge = false;
@@ -3732,6 +3812,8 @@ class MintClient
         curl_setopt_array($ch, [
             CURLOPT_URL => $url,
             CURLOPT_RETURNTRANSFER => true,
+            // A redirect target would bypass the scheme check and the connect guard.
+            CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_TIMEOUT => $timeout ?? $this->timeout,
             CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_SSL_VERIFYPEER => true,
@@ -3749,7 +3831,7 @@ class MintClient
                 }
                 return strlen($chunk);
             },
-        ] + self::curlProtocolOptions());
+        ] + $guardOptions + self::curlProtocolOptions());
 
         if ($method === 'POST') {
             curl_setopt($ch, CURLOPT_POST, true);
@@ -6771,7 +6853,8 @@ class Wallet
         $newProofs = [];
         foreach ($signatures as $i => $signature) {
             if (($signature['id'] ?? null) !== $pendingData['keyset_id']
-                || (int)($signature['amount'] ?? -1) !== (int)$pendingData['amounts'][$i]) {
+                // Strict, as in mint(): "64" or 64.0 must not pass as 64.
+                || ($signature['amount'] ?? null) !== (int)$pendingData['amounts'][$i]) {
                 throw new CashuException('Mint returned swap signatures that do not match prepared outputs');
             }
             $pubkey = $this->getPublicKey($signature['id'], $signature['amount']);
@@ -6840,12 +6923,18 @@ class Wallet
         // getActiveKeysetId() keeps returning a keyset usable for outputs.
         foreach ($keysetsResponse['keysets'] ?? [] as $ks) {
             if (($ks['unit'] ?? 'sat') === $this->unit) {
+                // A negative fee would make calculateFee() hand the wallet extra output
+                // value; a string would be a TypeError under strict_types.
+                $feePpk = $ks['input_fee_ppk'] ?? 0;
+                if (!is_int($feePpk) || $feePpk < 0) {
+                    throw new CashuException('Mint advertised an invalid input fee for keyset ' . (is_string($ks['id'] ?? null) ? $ks['id'] : '?'));
+                }
                 $this->keysets[] = new Keyset(
                     $ks['id'],
                     $ks['unit'] ?? 'sat',
                     [],
                     $ks['active'] ?? true,
-                    $ks['input_fee_ppk'] ?? 0,
+                    $feePpk,
                     $ks['final_expiry'] ?? null
                 );
             }
@@ -7095,23 +7184,27 @@ class Wallet
 
     /**
      * The quote is what the customer will be charged: it must be for the amount and
-     * unit we asked for. Fields the mint omits are not checked; for sat the invoice's
-     * own amount must agree too, since that is what the payer's wallet pays.
+     * unit we asked for. The mint must state the amount, and the request must be a
+     * BOLT11 invoice with an amount (an amountless invoice lets the payer choose what
+     * to pay). For sat the invoice's own amount must agree too, since that is what the
+     * payer's wallet pays; other units cannot be compared to the invoice's sats.
      */
     private function assertQuoteMatchesRequest(MintQuote $quote, int $amount): void
     {
-        // fromArray() reads an absent amount as 0.
-        if ($quote->amount !== 0 && $quote->amount !== $amount) {
+        // fromArray() reads an absent amount as 0, and $amount is always > 0 here.
+        if ($quote->amount !== $amount) {
             throw new CashuException("Mint quote is for {$quote->amount} {$this->unit}, requested {$amount}");
         }
         if ($quote->unit !== null && strtolower($quote->unit) !== strtolower($this->unit)) {
             throw new CashuException("Mint quote is denominated in {$quote->unit}, not {$this->unit}");
         }
-        if (strtolower($this->unit) === 'sat') {
-            $invoiceSats = Bolt11::amountSats($quote->request);
-            if ($invoiceSats !== 0 && $invoiceSats !== $amount) {
-                throw new CashuException("Mint invoice is for {$invoiceSats} sat, requested {$amount}");
-            }
+        $invoice = preg_replace('/^lightning:/i', '', trim($quote->request));
+        $invoiceSats = Bolt11::amountSats($invoice);
+        if ($invoiceSats <= 0) {
+            throw new CashuException('Mint quote does not contain a Lightning invoice with an amount');
+        }
+        if (strtolower($this->unit) === 'sat' && $invoiceSats !== $amount) {
+            throw new CashuException("Mint invoice is for {$invoiceSats} sat, requested {$amount}");
         }
     }
 
@@ -7351,7 +7444,8 @@ class Wallet
      */
     public function checkMintQuote(string $quoteId): MintQuote
     {
-        $response = $this->client->get("mint/quote/bolt11/$quoteId");
+        // The id comes from the mint (or a stored journal): never let it change the path.
+        $response = $this->client->get('mint/quote/bolt11/' . rawurlencode($quoteId));
         return MintQuote::fromArray($response);
     }
 
@@ -7559,7 +7653,8 @@ class Wallet
      */
     public function checkMeltQuote(string $quoteId): MeltQuote
     {
-        $response = $this->client->get("melt/quote/bolt11/$quoteId");
+        // The id comes from the mint (or a stored journal): never let it change the path.
+        $response = $this->client->get('melt/quote/bolt11/' . rawurlencode($quoteId));
         return MeltQuote::fromArray($response);
     }
 
@@ -8064,20 +8159,10 @@ class Wallet
     public function receive(string $tokenString): array
     {
         $token = $this->deserializeToken($tokenString);
+        self::assertNoDuplicateProofs($token->proofs);
         $this->assertReceivable($token);
 
         $this->resolveShortKeysetIds($token->proofs);
-
-        // NUT-12: if a received proof carries a full DLEQ (with blinding factor),
-        // wallets MUST verify it — it proves the mint actually signed this proof.
-        foreach ($token->proofs as $proof) {
-            if ($proof->dleq !== null && $proof->dleq->r !== null && $proof->dleq->r !== '') {
-                $A = $this->getPublicKey($proof->id, $proof->amount);
-                if (!Crypto::verifyProofDleq($proof, $A)) {
-                    throw new CashuException('Received token contains an invalid DLEQ proof');
-                }
-            }
-        }
 
         // Calculate fee and output amount
         $inputAmount = $token->getAmount();
@@ -8114,9 +8199,42 @@ class Wallet
             }
         }
 
+        // NUT-12: if a received proof carries a full DLEQ (with blinding factor),
+        // wallets MUST verify it — it proves the mint actually signed this proof.
+        // After the NUT-07 check: a pasted spent token is refused with one request
+        // instead of an EC verification per proof first (C1).
+        foreach ($token->proofs as $proof) {
+            if ($proof->dleq !== null && $proof->dleq->r !== null && $proof->dleq->r !== '') {
+                $A = $this->getPublicKey($proof->id, $proof->amount);
+                if (!Crypto::verifyProofDleq($proof, $A)) {
+                    throw new CashuException('Received token contains an invalid DLEQ proof');
+                }
+            }
+        }
+
         // Split output amount into powers of 2
         $amounts = self::splitAmount($outputAmount);
         return $this->swap($token->proofs, $amounts);
+    }
+
+    /**
+     * Refuse a token that lists the same proof twice.
+     *
+     * The mint rejects duplicate inputs, but only after the wallet has paid for a DLEQ
+     * verification per copy and reserved output counters for the inflated amount (C1).
+     * Y = hash_to_curve(secret), so equal secrets are exactly equal Ys.
+     *
+     * @param Proof[] $proofs
+     */
+    private static function assertNoDuplicateProofs(array $proofs): void
+    {
+        $seen = [];
+        foreach ($proofs as $proof) {
+            if (isset($seen[$proof->secret])) {
+                throw new CashuException('Token contains the same proof more than once');
+            }
+            $seen[$proof->secret] = true;
+        }
     }
 
     /** NUT-07 is optional; skip the pre-check only when the mint says it lacks it. */
@@ -10104,6 +10222,8 @@ class LightningAddress
             throw new CashuException('Refusing to fetch a non-HTTPS LNURL endpoint');
         }
 
+        $guardOptions = ConnectGuard::curlOptions($url, 'lnurl');
+
         $body = '';
         $tooLarge = false;
         $ch = curl_init($url);
@@ -10122,7 +10242,7 @@ class LightningAddress
                 }
                 return strlen($chunk);
             },
-        ] + MintClient::curlProtocolOptions());
+        ] + $guardOptions + MintClient::curlProtocolOptions());
 
         curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
