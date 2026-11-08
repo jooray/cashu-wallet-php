@@ -1147,6 +1147,10 @@ class Crypto
         // C = C_ - r*A
         $rA = Secp256k1::scalarMult($r, $A_point);
         $C = Secp256k1::pointSub($C_point, $rA);
+        if ($C === null) {
+            // C_ = r*A: the point at infinity is not a signature (and not a TypeError).
+            throw new CashuException('Invalid blind signature: unblinds to the point at infinity');
+        }
 
         return bin2hex(Secp256k1::compressPoint($C));
     }
@@ -2154,7 +2158,10 @@ class MintQuote
     public function isPaid(): bool
     {
         if ($this->amountPaid !== null && $this->amountIssued !== null) {
-            return $this->amountPaid > $this->amountIssued;
+            // A bolt11 quote is paid in full or not at all, so less than the quote's amount
+            // mintable is not a payment this wallet can mint (it mints the full amount);
+            // honest bolt11 mints never report it (CPS-04).
+            return $this->amountPaid - $this->amountIssued >= max(1, $this->amount);
         }
         return strtoupper($this->state) === 'PAID';
     }
@@ -2304,11 +2311,20 @@ class Transport
 
     public static function fromArray(array $data): self
     {
-        return new self(
-            $data['t'] ?? '',
-            $data['a'] ?? '',
-            $data['g'] ?? []
-        );
+        // Decoded from a creqA string: wrong types are a malformed request, not a
+        // TypeError (CW-08).
+        $type = $data['t'] ?? '';
+        $target = $data['a'] ?? '';
+        $tags = $data['g'] ?? [];
+        if (!is_string($type) || !is_string($target) || !is_array($tags)) {
+            throw new CashuException('Invalid payment request: malformed transport');
+        }
+        foreach ($tags as $tag) {
+            if (!is_array($tag) || $tag === [] || array_filter($tag, fn($v) => !is_string($v)) !== []) {
+                throw new CashuException('Invalid payment request: malformed transport tag');
+            }
+        }
+        return new self($type, $target, array_values(array_map('array_values', $tags)));
     }
 
     /**
@@ -2437,9 +2453,13 @@ class PaymentRequest
             }
         }
 
+        if (isset($data['a']) && (!is_int($data['a']) || $data['a'] < 0)) {
+            throw new CashuException('Invalid payment request: amount must be a non-negative integer');
+        }
+
         return new self(
             is_string($data['i'] ?? null) ? $data['i'] : '',
-            isset($data['a']) ? (int)$data['a'] : null,
+            isset($data['a']) ? $data['a'] : null,
             is_string($data['u'] ?? null) ? $data['u'] : 'sat',
             is_array($data['m'] ?? null) ? array_values($data['m']) : [],
             is_string($data['d'] ?? null) ? $data['d'] : null,
@@ -3049,6 +3069,12 @@ class Token
 // CBOR ENCODER/DECODER (Minimal implementation for token serialization)
 // ============================================================================
 
+/** A CBOR byte string (major type 2), whatever bytes it holds. */
+final class CBORBytes
+{
+    public function __construct(public readonly string $bytes) {}
+}
+
 /**
  * Minimal CBOR encoder/decoder for Cashu tokens
  */
@@ -3083,8 +3109,14 @@ class CBOR
             }
         }
 
+        if ($value instanceof CBORBytes) {
+            return self::encodeByteString($value->bytes);
+        }
+
         if (is_string($value)) {
-            // Check if it's binary data (contains non-UTF8 or is marked as bytes)
+            // Plain strings are guessed: binary data (non-UTF-8 or control bytes) becomes a
+            // byte string. Fields that must be bytes whatever their content are wrapped
+            // in CBORBytes instead (CW-05).
             if (!mb_check_encoding($value, 'UTF-8') || self::isBinaryString($value)) {
                 return self::encodeByteString($value);
             }
@@ -3385,16 +3417,18 @@ class TokenSerializer
                 $p = [
                     'a' => $proof->amount,
                     's' => $proof->secret,
-                    'c' => hex2bin($proof->C)
+                    'c' => new CBORBytes(self::hexToBytes($proof->C, 'proof signature'))
                 ];
 
                 // NUT-12 requires all three fields; a proof restored from the mint has no
                 // blinding factor, so its DLEQ is simply omitted rather than fataling.
-                if ($includeDleq && $proof->dleq !== null && $proof->dleq->r !== null) {
+                // Scalars are 32 bytes: some mints drop leading zeroes, and an odd-length
+                // hex2bin() used to become CBOR `false` (CW-05).
+                if ($includeDleq && $proof->dleq !== null && $proof->dleq->r !== null && $proof->dleq->r !== '') {
                     $p['d'] = [
-                        'e' => hex2bin($proof->dleq->e),
-                        's' => hex2bin($proof->dleq->s),
-                        'r' => hex2bin($proof->dleq->r)
+                        'e' => new CBORBytes(self::hexToBytes($proof->dleq->e, 'DLEQ e', 64)),
+                        's' => new CBORBytes(self::hexToBytes($proof->dleq->s, 'DLEQ s', 64)),
+                        'r' => new CBORBytes(self::hexToBytes($proof->dleq->r, 'DLEQ r', 64))
                     ];
                 }
 
@@ -3406,7 +3440,7 @@ class TokenSerializer
             }
 
             $tokenData['t'][] = [
-                'i' => hex2bin($keysetId),
+                'i' => new CBORBytes(self::hexToBytes((string)$keysetId, 'keyset ID')),
                 'p' => $proofArray
             ];
         }
@@ -3419,6 +3453,19 @@ class TokenSerializer
         $base64 = rtrim(strtr(base64_encode($cbor), '+/', '-_'), '=');
 
         return 'cashuB' . $base64;
+    }
+
+    /** Hex to bytes for V4 fields; $width left-pads a fixed-size scalar. */
+    private static function hexToBytes(string $hex, string $what, int $width = 0): string
+    {
+        if ($width > 0 && strlen($hex) < $width) {
+            $hex = str_pad($hex, $width, '0', STR_PAD_LEFT);
+        }
+        $bytes = (strlen($hex) % 2 === 0 && ctype_xdigit($hex)) ? hex2bin($hex) : false;
+        if ($bytes === false) {
+            throw new CashuException("Cannot serialize V4 token: malformed $what");
+        }
+        return $bytes;
     }
 
     /**
@@ -3510,6 +3557,10 @@ class TokenSerializer
             throw new CashuException('Invalid token: malformed witness');
         }
 
+        // Hex IDs are compared case-sensitively against the mint's (lower-case) keysets.
+        if (self::isHexKeysetId($keysetId)) {
+            $keysetId = strtolower($keysetId);
+        }
         return new Proof($keysetId, $amount, $secret, strtolower($C), $dleq, $witness);
     }
 
@@ -4944,19 +4995,31 @@ class WalletStorage
             return;
         }
 
-        $placeholders = implode(',', array_fill(0, count($secrets), '?'));
-        $params = array_merge(
-            [$state, $state === ProofState::SPENT ? time() : null, $this->walletId],
-            $secrets
-        );
-
-        $stmt = $this->pdo->prepare("
-            UPDATE cashu_proofs
-            SET state = ?, spent_at = ?
-            WHERE wallet_id = ? AND secret IN ($placeholders)
-        ");
-        $stmt->execute($params);
+        // Chunked like transitionProofStates(): SQLite builds before 3.32 allow only 999
+        // bound variables, and a token may carry 1,000 proofs (CW-04). One transaction.
+        $savepoint = $this->beginWrite();
+        try {
+            foreach (array_chunk(array_values($secrets), self::SQL_IN_CHUNK) as $chunk) {
+                $placeholders = implode(',', array_fill(0, count($chunk), '?'));
+                $stmt = $this->pdo->prepare("
+                    UPDATE cashu_proofs
+                    SET state = ?, spent_at = ?
+                    WHERE wallet_id = ? AND secret IN ($placeholders)
+                ");
+                $stmt->execute(array_merge(
+                    [$state, $state === ProofState::SPENT ? time() : null, $this->walletId],
+                    $chunk
+                ));
+            }
+            $this->commitWrite($savepoint);
+        } catch (\Throwable $e) {
+            $this->rollbackWrite($savepoint);
+            throw $e;
+        }
     }
+
+    /** Secrets per `IN (...)` list; well under SQLite's historical 999-variable limit. */
+    private const SQL_IN_CHUNK = 400;
 
     /**
      * Get proof states by their secrets
@@ -4970,16 +5033,17 @@ class WalletStorage
             return [];
         }
 
-        $placeholders = implode(',', array_fill(0, count($secrets), '?'));
-        $stmt = $this->pdo->prepare("
-            SELECT secret, state FROM cashu_proofs
-            WHERE wallet_id = ? AND secret IN ($placeholders)
-        ");
-        $stmt->execute(array_merge([$this->walletId], $secrets));
-
         $result = [];
-        while ($row = $stmt->fetch(\PDO::FETCH_ASSOC)) {
-            $result[$row['secret']] = $row['state'];
+        foreach (array_chunk(array_values($secrets), self::SQL_IN_CHUNK) as $chunk) {
+            $placeholders = implode(',', array_fill(0, count($chunk), '?'));
+            $stmt = $this->pdo->prepare("
+                SELECT secret, state FROM cashu_proofs
+                WHERE wallet_id = ? AND secret IN ($placeholders)
+            ");
+            $stmt->execute(array_merge([$this->walletId], $chunk));
+            while ($row = $stmt->fetch(\PDO::FETCH_ASSOC)) {
+                $result[$row['secret']] = $row['state'];
+            }
         }
         return $result;
     }
@@ -4995,14 +5059,21 @@ class WalletStorage
             return;
         }
 
-        $placeholders = implode(',', array_fill(0, count($secrets), '?'));
-        $params = array_merge([$this->walletId], $secrets);
-
-        $stmt = $this->pdo->prepare("
-            DELETE FROM cashu_proofs
-            WHERE wallet_id = ? AND secret IN ($placeholders)
-        ");
-        $stmt->execute($params);
+        $savepoint = $this->beginWrite();
+        try {
+            foreach (array_chunk(array_values($secrets), self::SQL_IN_CHUNK) as $chunk) {
+                $placeholders = implode(',', array_fill(0, count($chunk), '?'));
+                $stmt = $this->pdo->prepare("
+                    DELETE FROM cashu_proofs
+                    WHERE wallet_id = ? AND secret IN ($placeholders)
+                ");
+                $stmt->execute(array_merge([$this->walletId], $chunk));
+            }
+            $this->commitWrite($savepoint);
+        } catch (\Throwable $e) {
+            $this->rollbackWrite($savepoint);
+            throw $e;
+        }
     }
 
     // ========================================================================
@@ -5082,14 +5153,18 @@ class WalletStorage
         if (empty($secrets)) {
             return [];
         }
-        $placeholders = implode(',', array_fill(0, count($secrets), '?'));
-        $stmt = $this->pdo->prepare(
-            "SELECT keyset_id, amount, secret, C, dleq, witness FROM cashu_proofs
-             WHERE wallet_id = ? AND secret IN ($placeholders)"
-        );
-        $stmt->execute(array_merge([$this->walletId], $secrets));
+        $rows = [];
+        foreach (array_chunk(array_values($secrets), self::SQL_IN_CHUNK) as $chunk) {
+            $placeholders = implode(',', array_fill(0, count($chunk), '?'));
+            $stmt = $this->pdo->prepare(
+                "SELECT keyset_id, amount, secret, C, dleq, witness FROM cashu_proofs
+                 WHERE wallet_id = ? AND secret IN ($placeholders)"
+            );
+            $stmt->execute(array_merge([$this->walletId], $chunk));
+            array_push($rows, ...$stmt->fetchAll(\PDO::FETCH_ASSOC));
+        }
         $bySecret = [];
-        foreach ($stmt->fetchAll(\PDO::FETCH_ASSOC) as $row) {
+        foreach ($rows as $row) {
             $dleq = null;
             if (!empty($row['dleq'])) {
                 $data = json_decode($row['dleq'], true);
@@ -5348,18 +5423,24 @@ class WalletStorage
         try {
             $operation = $this->getPendingOperationById($id);
             if ($operation === null) {
-                // A completed/deleted journal no longer owns any inputs or outputs.
+                // A completed/deleted journal no longer owns any inputs. Outputs the mint
+                // signed for us are still ours, though: keep them (CW-03; idempotent).
+                $this->storeProofs($outputProofs);
                 $this->commitWrite($savepoint);
                 return;
             }
-            if (!in_array($operation['type'], ['swap', 'melt'], true)
-                || ($operation['data']['input_secrets'] ?? null) !== $inputSecrets
-                || count(array_unique($inputSecrets)) !== count($inputSecrets)
-                || !in_array($inputState, [ProofState::SPENT, ProofState::UNSPENT], true)
-                || ($inputState === ProofState::UNSPENT && !empty($outputProofs))) {
-                throw new CashuException('Finalization does not match the pending spend');
+            try {
+                if (!in_array($operation['type'], ['swap', 'melt'], true)
+                    || ($operation['data']['input_secrets'] ?? null) !== $inputSecrets
+                    || count(array_unique($inputSecrets)) !== count($inputSecrets)
+                    || !in_array($inputState, [ProofState::SPENT, ProofState::UNSPENT], true)
+                    || ($inputState === ProofState::UNSPENT && !empty($outputProofs))) {
+                    throw new CashuException('Finalization does not match the pending spend');
+                }
+                $this->assertOwnsReservedInputs($id, $inputSecrets);
+            } catch (CashuException $refused) {
+                $this->keepOutputsAndThrow($savepoint, $outputProofs, $refused);
             }
-            $this->assertOwnsReservedInputs($id, $inputSecrets);
             if (!empty($outputProofs)) {
                 $this->storeProofs($outputProofs);
             }
@@ -5398,23 +5479,28 @@ class WalletStorage
         try {
             $operation = $this->getPendingOperationById($id);
             if ($operation === null) {
+                $this->storeProofs($outputProofs); // see finalizePendingSpend() (CW-03)
                 $this->commitWrite($savepoint);
                 return;
             }
             $imported = array_flip($operation['data']['imported_secrets'] ?? []);
-            if (!in_array($operation['type'], ['swap', 'melt'], true)
-                || ($operation['data']['input_secrets'] ?? null) !== $inputSecrets
-                || count($outcome) !== count($inputSecrets)) {
-                throw new CashuException('Settlement does not match the pending spend');
-            }
-            foreach ($inputSecrets as $secret) {
-                if (!array_key_exists($secret, $outcome)
-                    || !in_array($outcome[$secret], [ProofState::SPENT, ProofState::UNSPENT, null], true)
-                    || ($outcome[$secret] === null && !isset($imported[$secret]))) {
+            try {
+                if (!in_array($operation['type'], ['swap', 'melt'], true)
+                    || ($operation['data']['input_secrets'] ?? null) !== $inputSecrets
+                    || count($outcome) !== count($inputSecrets)) {
                     throw new CashuException('Settlement does not match the pending spend');
                 }
+                foreach ($inputSecrets as $secret) {
+                    if (!array_key_exists($secret, $outcome)
+                        || !in_array($outcome[$secret], [ProofState::SPENT, ProofState::UNSPENT, null], true)
+                        || ($outcome[$secret] === null && !isset($imported[$secret]))) {
+                        throw new CashuException('Settlement does not match the pending spend');
+                    }
+                }
+                $this->assertOwnsReservedInputs($id, $inputSecrets);
+            } catch (CashuException $refused) {
+                $this->keepOutputsAndThrow($savepoint, $outputProofs, $refused);
             }
-            $this->assertOwnsReservedInputs($id, $inputSecrets);
             if (!empty($outputProofs)) {
                 $this->storeProofs($outputProofs);
             }
@@ -5446,6 +5532,29 @@ class WalletStorage
             $this->rollbackWrite($savepoint);
             throw $e;
         }
+    }
+
+    /**
+     * A journal that cannot be finalized stays as it is, but outputs the mint already
+     * signed for us are stored before the refusal propagates (CW-03): they are bearer
+     * value nobody else holds, and storing is idempotent, so a later finalization of the
+     * same journal (after the inputs are put back) only finds them present.
+     *
+     * @param Proof[] $outputProofs
+     * @return never
+     */
+    private function keepOutputsAndThrow(?string $savepoint, array $outputProofs, CashuException $refused): void
+    {
+        if (!empty($outputProofs)) {
+            $this->storeProofs($outputProofs);
+            $this->commitWrite($savepoint);
+            throw new CashuException(
+                $refused->getMessage() . ' (the signed outputs were stored; the journal is kept)',
+                (int)$refused->getCode(),
+                $refused
+            );
+        }
+        throw $refused;
     }
 
     /**
@@ -5541,6 +5650,8 @@ class WalletStorage
                 'keyset_id' => $rejectedPlan['keyset_id'],
                 'counter_start' => $rejectedPlan['counter_start'],
                 'count' => count($rejectedPlan['amounts'] ?? []),
+                // Kept so a late signature on this plan can still be recovered (CW-01).
+                'amounts' => array_values($rejectedPlan['amounts'] ?? []),
                 'at' => time(),
             ];
             $plan = [
@@ -5563,25 +5674,61 @@ class WalletStorage
     // PENDING OPERATIONS (for crash recovery)
     // ========================================================================
 
-    /** Complete only the exact mint plan that produced these outputs. */
+    /**
+     * Complete a mint journal with the outputs of the plan that produced them: the
+     * current plan, or one it replaced (CW-01). A replaced plan whose request was still
+     * in flight when it was replaced can be the one the mint signed; a quote is issued
+     * once, so then the current plan was never signed and its counters just stay burned.
+     * Signed outputs are never dropped: with no journal left, or a plan this journal
+     * never had, they are stored anyway (idempotent) and only the journal is left alone.
+     */
     public function finalizePendingMint(string $quoteId, array $plan, array $proofs): void
     {
         $savepoint = $this->beginWrite();
         try {
             $pending = $this->getPendingOperationById('mint:' . $quoteId);
-            if ($pending !== null) {
-                if ($pending['type'] !== 'mint' || $pending['data'] !== $plan) {
+            if ($pending === null) {
+                $this->storeProofs($proofs, $quoteId);
+                $this->commitWrite($savepoint);
+                return;
+            }
+            if ($pending['type'] !== 'mint' || !self::isPlanOfMintJournal($pending['data'], $plan)) {
+                if (empty($proofs)) {
                     throw new CashuException('Mint completion does not match the pending plan');
                 }
                 $this->storeProofs($proofs, $quoteId);
-                $this->deletePendingOperation('mint:' . $quoteId);
-                $this->deleteMintQuoteKey($quoteId);
+                $this->commitWrite($savepoint);
+                throw new CashuException(
+                    'Mint completion does not match the pending plan (the signed outputs were stored; the journal is kept)'
+                );
             }
+            $this->storeProofs($proofs, $quoteId);
+            $this->deletePendingOperation('mint:' . $quoteId);
+            $this->deleteMintQuoteKey($quoteId);
             $this->commitWrite($savepoint);
         } catch (\Throwable $e) {
             $this->rollbackWrite($savepoint);
             throw $e;
         }
+    }
+
+    /** Whether $plan is the journal's current plan or one recorded in its replaced_plans. */
+    private static function isPlanOfMintJournal(array $journal, array $plan): bool
+    {
+        if ($journal === $plan) {
+            return true;
+        }
+        $amounts = array_values($plan['amounts'] ?? []);
+        foreach ($journal['replaced_plans'] ?? [] as $old) {
+            if (is_array($old)
+                && ($old['keyset_id'] ?? null) === ($plan['keyset_id'] ?? null)
+                && (int)($old['counter_start'] ?? -1) === (int)($plan['counter_start'] ?? -2)
+                && (int)($old['count'] ?? -1) === count($amounts)
+                && (!isset($old['amounts']) || array_values($old['amounts']) === $amounts)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -6448,14 +6595,14 @@ class Wallet
                 }
 
                 if ($quote->isIssued()) {
-                    // The mint signed these exact outputs. Ask for them back.
-                    $proofs = $this->recoverPendingOutputs($op['data']);
-                    if (count($proofs) !== count($op['data']['amounts'] ?? [])) {
+                    // The mint signed one of the journal's plans. Ask for it back.
+                    [$plan, $proofs] = $this->recoverMintJournalOutputs($op['data']);
+                    if (empty($proofs) || count($proofs) !== count($plan['amounts'] ?? [])) {
                         // Incomplete: keep the journal rather than finalize a partial set.
                         $result['still_pending']++;
                         continue;
                     }
-                    $this->storage->finalizePendingMint($quoteId, $op['data'], $proofs);
+                    $this->storage->finalizePendingMint($quoteId, $plan, $proofs);
                     $result['recovered']++;
                     $result['amount'] += self::sumProofs($proofs);
                     continue;
@@ -6488,7 +6635,7 @@ class Wallet
      */
     private function settleMintJournalByRestore(string $id, string $quoteId, array $plan, array &$result): string
     {
-        $proofs = $this->recoverPendingOutputs($plan);
+        [$plan, $proofs] = $this->recoverMintJournalOutputs($plan);
         if (empty($proofs)) {
             $this->storage->deletePendingOperation($id);
             $this->storage->deleteMintQuoteKey($quoteId);
@@ -6505,6 +6652,56 @@ class Wallet
     }
 
     /**
+     * NUT-09 for a mint journal: its current plan, else the plans it replaced, newest
+     * first (CW-01). A quote is issued once, so at most one plan has signatures.
+     *
+     * @return array{0: array, 1: Proof[]} the plan whose outputs were found (the current
+     *         plan when none were) and those proofs
+     */
+    private function recoverMintJournalOutputs(array $data): array
+    {
+        $proofs = $this->recoverPendingOutputs($data);
+        if (!empty($proofs)) {
+            return [$data, $proofs];
+        }
+        foreach (array_reverse($data['replaced_plans'] ?? []) as $old) {
+            $plan = is_array($old) ? self::replacedMintPlan($old, $data) : null;
+            if ($plan === null) {
+                continue;
+            }
+            $proofs = $this->recoverPendingOutputs($plan);
+            if (!empty($proofs)) {
+                return [$plan, $proofs];
+            }
+        }
+        return [$data, []];
+    }
+
+    /** A replaced_plans entry as a plan recoverPendingOutputs() can query, or null. */
+    private static function replacedMintPlan(array $old, array $current): ?array
+    {
+        if (!is_string($old['keyset_id'] ?? null) || !is_int($old['counter_start'] ?? null)) {
+            return null;
+        }
+        $amounts = $old['amounts'] ?? null;
+        if (!is_array($amounts)) {
+            // Recorded before replaced plans kept their amounts. Every plan of a quote
+            // splits the same amount with splitAmount(), so the current plan's amounts
+            // are the old plan's whenever the count agrees.
+            if (count($current['amounts'] ?? []) !== (int)($old['count'] ?? -1)) {
+                return null;
+            }
+            $amounts = $current['amounts'];
+        }
+        return [
+            'counter_start' => $old['counter_start'],
+            'keyset_id' => $old['keyset_id'],
+            'amounts' => array_values($amounts),
+            'input_secrets' => [],
+        ];
+    }
+
+    /**
      * Bring every swap journal to a terminal state where the mint's answers allow it
      * (audit L-2, N6, N19).
      *
@@ -6516,7 +6713,8 @@ class Wallet
      * - Some or all inputs SPENT but none of our outputs signed: a swap is atomic, so
      *   someone else spent those inputs (typically a received token the sender
      *   double-spent). SPENT inputs are marked SPENT, UNSPENT ones released
-     *   (`double_spent`).
+     *   (`double_spent`). Inputs the journal imported (a received token) are deleted
+     *   in this case and on a rejected plan: they were never ours (CPS-01/CW-02).
      * - Anything else — inputs PENDING at the mint, an unreadable or partial answer, a
      *   transport error, some outputs signed: the journal is kept (`still_pending` /
      *   `errors`). Nothing the mint reports SPENT is ever made UNSPENT.
@@ -6556,7 +6754,7 @@ class Wallet
                 continue;
             }
             try {
-                $outcome = $this->resolveSwapJournal($op['id'], $op['data'], false, false);
+                $outcome = $this->resolveSwapJournal($op['id'], $op['data'], false);
                 if ($outcome['outcome'] === 'resubmit') {
                     $proofs = $this->storage->getProofsBySecretsAsObjects($op['data']['input_secrets'] ?? []);
                     try {
@@ -6566,7 +6764,7 @@ class Wallet
                         if (!self::isDefinitiveRejection($e)) {
                             throw $e;
                         }
-                        $outcome = $this->resolveSwapJournal($op['id'], $op['data'], true, false);
+                        $outcome = $this->resolveSwapJournal($op['id'], $op['data'], true);
                         if ($outcome['outcome'] === 'still_pending') {
                             $result['errors'][$op['id']] = $e->getMessage();
                         }
@@ -6621,14 +6819,16 @@ class Wallet
     /**
      * Decide a swap journal from the mint's authoritative answers (see
      * recoverPendingSwaps()). $rejected: the recorded plan was just definitively
-     * rejected. $direct: the caller of swap()/receive() is present and gets an
-     * exception, so inputs this journal imported are removed instead of released.
+     * rejected. Inputs this journal imported (a received token) are removed whenever
+     * none of our outputs were signed, whether the caller of swap()/receive() is present
+     * or this is background recovery: they never became ours, and a SPENT row would read
+     * as a completed receive (CPS-01), an UNSPENT one as balance the mint refused (CW-02).
      *
      * @return array{outcome: string, proofs?: Proof[]} outcome: recovered, released,
      *         double_spent, resubmit or still_pending
      * @throws CashuException when the mint's answers are unreadable (journal kept)
      */
-    private function resolveSwapJournal(string $id, array $data, bool $rejected, bool $direct): array
+    private function resolveSwapJournal(string $id, array $data, bool $rejected): array
     {
         $secrets = $data['input_secrets'] ?? [];
         if (empty($secrets)) {
@@ -6662,7 +6862,7 @@ class Wallet
         $imported = array_flip($data['imported_secrets'] ?? []);
         $outcome = [];
         foreach ($states as $secret => $state) {
-            if ($direct && isset($imported[$secret])) {
+            if (isset($imported[$secret])) {
                 $outcome[$secret] = null;
             } else {
                 $outcome[$secret] = $state === ProofState::SPENT ? ProofState::SPENT : ProofState::UNSPENT;
@@ -6786,7 +6986,17 @@ class Wallet
             $candidates[] = $proof;
         }
 
-        foreach (array_chunk($candidates, $batchSize) as $batch) {
+        // One keyset per batch, so a mint refusing one (e.g. already expired) does not
+        // fail proofs of the others with it (CW-10).
+        $batches = [];
+        $byKeyset = [];
+        foreach ($candidates as $proof) {
+            $byKeyset[$proof->id][] = $proof;
+        }
+        foreach ($byKeyset as $keysetProofs) {
+            array_push($batches, ...array_chunk($keysetProofs, max(1, $batchSize)));
+        }
+        foreach ($batches as $batch) {
             try {
                 $fee = $this->calculateFee($batch);
                 $amount = self::sumProofs($batch) - $fee;
@@ -6808,19 +7018,40 @@ class Wallet
      * NUT-12: verify a DLEQ proof on a melt-change signature when present.
      * B_ is recomputed from the deterministic blinding data.
      */
-    private function verifyChangeSignatureDleq(array $sig, array $blinding, string $pubkey): void
+    private function verifyChangeSignatureDleq(array $sig, array $blinding, string $pubkey): ?DLEQWallet
     {
         if (!isset($sig['dleq'])) {
-            return;
+            return null;
         }
         $Bpoint = Secp256k1::pointAdd(
             Crypto::hashToCurve($blinding['secret']),
             Secp256k1::scalarMult($blinding['r'], Secp256k1::getGenerator())
         );
         $B_ = bin2hex(Secp256k1::compressPoint($Bpoint));
-        if (!Crypto::verifyDleq($sig['dleq']['e'], $sig['dleq']['s'], $pubkey, $B_, $sig['C_'])) {
-            throw new CashuException('Mint returned an invalid DLEQ proof for melt change');
+        return self::verifiedSignatureDleq($sig, $pubkey, $B_, $blinding['r'], 'melt change');
+    }
+
+    /**
+     * NUT-12: a DLEQ proof the mint attached to a blind signature. Wallets MUST verify
+     * one that is present; it is kept, with the blinding factor, so the proof stays
+     * verifiable offline (and in V4 tokens). A malformed one is an invalid proof, not a
+     * TypeError (CW-08). Scalars are stored at their full 32-byte width.
+     */
+    private static function verifiedSignatureDleq(array $sig, string $pubkey, string $B_, BigInt $r, string $what): ?DLEQWallet
+    {
+        if (!isset($sig['dleq'])) {
+            return null;
         }
+        $dleq = $sig['dleq'];
+        if (!is_array($dleq)
+            || !Crypto::verifyDleq($dleq['e'] ?? null, $dleq['s'] ?? null, $pubkey, $B_, $sig['C_'] ?? null)) {
+            throw new CashuException("Mint returned an invalid DLEQ proof for $what");
+        }
+        return new DLEQWallet(
+            str_pad(strtolower($dleq['e']), 64, '0', STR_PAD_LEFT),
+            str_pad(strtolower($dleq['s']), 64, '0', STR_PAD_LEFT),
+            Secp256k1::scalarToHex($r)
+        );
     }
 
     /** Submit an already journaled swap using its exact deterministic outputs. */
@@ -6859,18 +7090,7 @@ class Wallet
             }
             $pubkey = $this->getPublicKey($signature['id'], $signature['amount']);
 
-            $dleq = null;
-            if (isset($signature['dleq'])) {
-                // NUT-12: when the mint includes a DLEQ proof, wallets MUST verify it.
-                if (!Crypto::verifyDleq($signature['dleq']['e'], $signature['dleq']['s'], $pubkey, $outputs[$i]['B_'], $signature['C_'])) {
-                    throw new CashuException('Mint returned an invalid DLEQ proof for a swapped signature');
-                }
-                $dleq = new DLEQWallet(
-                    $signature['dleq']['e'],
-                    $signature['dleq']['s'],
-                    Secp256k1::scalarToHex($blindingData[$i]['r'])
-                );
-            }
+            $dleq = self::verifiedSignatureDleq($signature, $pubkey, $outputs[$i]['B_'], $blindingData[$i]['r'], 'a swapped signature');
 
             $newProofs[] = new Proof(
                 $signature['id'],
@@ -6928,6 +7148,10 @@ class Wallet
                 $feePpk = $ks['input_fee_ppk'] ?? 0;
                 if (!is_int($feePpk) || $feePpk < 0) {
                     throw new CashuException('Mint advertised an invalid input fee for keyset ' . (is_string($ks['id'] ?? null) ? $ks['id'] : '?'));
+                }
+                if (!is_string($ks['id'] ?? null)
+                    || (isset($ks['final_expiry']) && !is_int($ks['final_expiry']))) {
+                    throw new CashuException('Mint advertised a malformed keyset');
                 }
                 $this->keysets[] = new Keyset(
                     $ks['id'],
@@ -7038,9 +7262,11 @@ class Wallet
             if (($ks['id'] ?? null) !== $keysetId) {
                 continue;
             }
-            [$keys, $rawKeys] = self::partitionKeysetKeys($ks['keys'] ?? []);
+            [$keys, $rawKeys] = self::partitionKeysetKeys(is_array($ks['keys'] ?? null) ? $ks['keys'] : []);
+            $known = false;
             foreach ($this->keysets ?? [] as $keyset) {
                 if ($keyset->id === $keysetId) {
+                    $known = true;
                     $keyset->keys = $keys;
                     $keyset->rawKeys = $rawKeys;
                     // Enforce ID verification only for V2 IDs (see loadMint()).
@@ -7054,10 +7280,38 @@ class Wallet
                     }
                 }
             }
+            if (!$known && ($error = self::v2KeysetIdError($keysetId, $ks, $rawKeys)) !== null) {
+                // Not in this unit's /keysets: verify against the /keys metadata (CW-06).
+                throw new CashuException($error);
+            }
             $this->keys[$keysetId] = $keys;
             return;
         }
         throw new CashuException("Mint has no keys for keyset $keysetId");
+    }
+
+    /**
+     * NUT-02 check of a V2 ("01") keyset ID against keys and metadata from a keys or
+     * keysets response; null when it matches or the ID is not V2 (see loadMint()).
+     */
+    private static function v2KeysetIdError(string $keysetId, array $meta, array $rawKeys): ?string
+    {
+        if (strtolower(substr($keysetId, 0, 2)) !== '01') {
+            return null;
+        }
+        $fee = $meta['input_fee_ppk'] ?? 0;
+        $expiry = $meta['final_expiry'] ?? null;
+        if (!is_string($meta['unit'] ?? null) || !is_int($fee) || $fee < 0
+            || ($expiry !== null && !is_int($expiry))) {
+            return "Mint returned malformed metadata for keyset {$keysetId}";
+        }
+        $keyset = new Keyset($keysetId, $meta['unit'], [], true, $fee, $expiry);
+        $keyset->rawKeys = $rawKeys;
+        $expected = $keyset->deriveExpectedId();
+        if ($expected === null || !hash_equals(strtolower($expected), strtolower($keysetId))) {
+            return "Mint announced keyset ID {$keysetId} but its keys derive to " . ($expected ?? 'nothing');
+        }
+        return null;
     }
 
     /**
@@ -7070,8 +7324,11 @@ class Wallet
         // V1. Unusable keysets stay loaded so their existing proofs keep their fees.
         $best = null;
         $bestRank = 0;
+        $now = time();
         foreach ($this->keysets ?? [] as $keyset) {
-            if (!$keyset->active) {
+            // An active keyset past its final_expiry cannot hold new outputs (CW-10).
+            if (!$keyset->active || ($keyset->finalExpiry !== null && $keyset->finalExpiry !== 0
+                    && $keyset->finalExpiry <= $now)) {
                 continue;
             }
             $rank = Keyset::idVersionRank($keyset->id);
@@ -7138,7 +7395,13 @@ class Wallet
 
         $totalFeePpk = 0;
         foreach ($proofs as $proof) {
-            $totalFeePpk += $this->getInputFeePpk($proof->id);
+            $ppk = $this->getInputFeePpk($proof->id);
+            // An absurd advertised fee must not overflow into a float (TypeError in
+            // intdiv(), CW-08).
+            if ($ppk > PHP_INT_MAX - 999 - $totalFeePpk) {
+                throw new CashuException('Input fees overflow the maximum integer');
+            }
+            $totalFeePpk += $ppk;
         }
 
         return intdiv($totalFeePpk + 999, 1000);
@@ -7429,9 +7692,10 @@ class Wallet
         for ($counter = 0; $counter < $max; $counter++) {
             $key = $this->deriveQuoteLockingKey($counter);
             if (hash_equals(strtolower($quotePubkey), $key['pubkey'])) {
-                if ($this->storage && $known <= $counter) {
-                    // Never lower the counter; bump past the recovered index.
-                    $this->storage->setCounter(self::NUT20_COUNTER_ID, $counter + 1);
+                if ($this->storage) {
+                    // Never lower the counter, even if another worker moved it meanwhile;
+                    // bump past the recovered index (CW-12).
+                    $this->storage->raiseCounter(self::NUT20_COUNTER_ID, $counter + 1);
                 }
                 return $key;
             }
@@ -7451,6 +7715,15 @@ class Wallet
 
     /** Guards replanRejectedMint() against recursing more than once. */
     private bool $mintReplanning = false;
+
+    /**
+     * How many times one quote's plan may be replaced. Each replacement burns its
+     * counters for good; a mint that keeps refusing every plan (misconfigured, or a
+     * definitive error we misread) would otherwise get a fresh plan on every recovery
+     * tick, until later outputs fall beyond the NUT-13 restore look-ahead and a seed
+     * restore can no longer find them. A keyset rotation needs one replacement.
+     */
+    public const MAX_MINT_REPLANS = 3;
 
     /**
      * A paid, not issued quote whose recorded plan the mint definitively rejected (for
@@ -7480,6 +7753,16 @@ class Wallet
             CashuProtocolException::KEYSET_INACTIVE,
             CashuProtocolException::KEYSET_EXPIRED,
         ];
+        if (count($plan['replaced_plans'] ?? []) >= self::MAX_MINT_REPLANS) {
+            // Keep the journal (the quote is paid; a later signature or an operator
+            // restore can still settle it) but stop burning counters.
+            throw new CashuException(
+                'Mint keeps refusing this paid quote (' . $rejection->getMessage() . ') after '
+                . self::MAX_MINT_REPLANS . ' fresh attempts; journal retained',
+                $rejection->getCode(),
+                $rejection
+            );
+        }
         if (in_array($rejection->getCode(), $keysetCodes, true)) {
             try {
                 $this->loadMint();
@@ -7540,6 +7823,12 @@ class Wallet
 
         // Allocate one authoritative range under the same lock as journal creation.
         $pendingId = "mint:$quoteId";
+        if ($quote !== null && $quote->quote === $quoteId && $quote->isIssued()
+            && $this->storage->getPendingOperationById($pendingId) === null) {
+            // Issued, and never to outputs of ours: every output we send is journaled
+            // first. A new journal could never complete (CW-12).
+            throw new CashuException('Mint quote was already issued; nothing left to mint');
+        }
         $plan = $this->storage->preparePendingSpend($pendingId, 'mint', [], $keysetId, $amounts);
         if (array_sum($plan['amounts']) !== $amount) {
             throw new CashuException('Mint amount does not match the pending plan');
@@ -7570,11 +7859,13 @@ class Wallet
                 throw $e;
             }
             if ($quote->isIssued()) {
-                $proofs = $this->recoverPendingOutputs($plan);
-                if (count($proofs) !== count($outputs)) {
+                [$signedPlan, $proofs] = $this->recoverMintJournalOutputs(
+                    $this->storage->getPendingOperationById($pendingId)['data'] ?? $plan
+                );
+                if (empty($proofs) || count($proofs) !== count($signedPlan['amounts'] ?? [])) {
                     throw new CashuException('Issued mint recovery is incomplete; journal retained');
                 }
-                $this->storage->finalizePendingMint($quoteId, $plan, $proofs);
+                $this->storage->finalizePendingMint($quoteId, $signedPlan, $proofs);
                 return $proofs;
             }
             if ($quote->isPaid() && !$this->mintReplanning && self::isDefinitiveRejection($e)
@@ -7604,18 +7895,7 @@ class Wallet
             $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
             $C = Crypto::unblindSignature($sig['C_'], $blindingData[$i]['r'], $pubkey);
 
-            $dleq = null;
-            if (isset($sig['dleq'])) {
-                // NUT-12: when the mint includes a DLEQ proof, wallets MUST verify it.
-                if (!Crypto::verifyDleq($sig['dleq']['e'], $sig['dleq']['s'], $pubkey, $outputs[$i]['B_'], $sig['C_'])) {
-                    throw new CashuException('Mint returned an invalid DLEQ proof for a minted signature');
-                }
-                $dleq = new DLEQWallet(
-                    $sig['dleq']['e'],
-                    $sig['dleq']['s'],
-                    Secp256k1::scalarToHex($blindingData[$i]['r'])
-                );
-            }
+            $dleq = self::verifiedSignatureDleq($sig, $pubkey, $outputs[$i]['B_'], $blindingData[$i]['r'], 'a minted signature');
 
             $proofs[] = new Proof(
                 $sig['id'],
@@ -7940,14 +8220,16 @@ class Wallet
                 continue;
             }
             $pubkey = $this->getPublicKey($sig['id'], $sig['amount']);
-            $this->verifyChangeSignatureDleq($sig, $blindingData[$i], $pubkey);
+            // Kept on the proof like mint/swap DLEQs (CW-09).
+            $dleq = $this->verifyChangeSignatureDleq($sig, $blindingData[$i], $pubkey);
             $C = Crypto::unblindSignature($sig['C_'], $blindingData[$i]['r'], $pubkey);
 
             $changeProofs[] = new Proof(
                 $sig['id'],
                 $sig['amount'],
                 $blindingData[$i]['secret'],
-                $C
+                $C,
+                $dleq
             );
         }
         return $changeProofs;
@@ -7970,7 +8252,18 @@ class Wallet
      */
     public function swap(array $proofs, array $amounts, array $reservableStates = [ProofState::UNSPENT]): array
     {
+        // Checked before anything is journaled (CW-11): an input-less journal could never
+        // be resolved, and a denomination the keyset lacks is a sure rejection.
+        if (empty($proofs)) {
+            throw new CashuException('Swap needs at least one input');
+        }
         $keysetId = $this->getActiveKeysetId();
+        foreach ($amounts as $a) {
+            if (!is_int($a) || $a <= 0) {
+                throw new CashuException('Swap output amounts must be positive integers');
+            }
+            $this->getPublicKey($keysetId, $a);
+        }
         $inputSum = self::sumProofs($proofs);
         $fee = $this->calculateFee($proofs);
         $outputSum = array_sum($amounts);
@@ -8017,7 +8310,7 @@ class Wallet
             // PENDING rows: a replayed swap that already succeeded is recovered, a
             // double-spent token is recorded, a refused plan releases the inputs.
             try {
-                $outcome = $this->resolveSwapJournal($pendingId, $pendingData, true, true);
+                $outcome = $this->resolveSwapJournal($pendingId, $pendingData, true);
             } catch (\Throwable $ignored) {
                 throw $e;
             }
@@ -8036,6 +8329,9 @@ class Wallet
      */
     public function split(array $proofs, int $amount): array
     {
+        if ($amount <= 0) {
+            throw new CashuException('Split amount must be positive');
+        }
         $total = self::sumProofs($proofs);
         $fee = $this->calculateFee($proofs);
 
@@ -8054,7 +8350,11 @@ class Wallet
         $sendAmounts = self::splitAmount($amount);
         $keepAmounts = self::splitAmount($keepAmount);
 
+        // NUT-03: outputs in ascending amount order, so their order does not tell the
+        // mint which part is sent and which kept (CW-11). Sorting is safe for the
+        // separation below, which matches by amount, not position.
         $allAmounts = array_merge($sendAmounts, $keepAmounts);
+        sort($allAmounts);
         $newProofs = $this->swap($proofs, $allAmounts);
 
         // Separate into send and keep
@@ -8417,6 +8717,11 @@ class Wallet
         foreach ($proofs as $proof) {
             if ($sum >= $amount + $this->calculateFee($selected)) {
                 break;
+            }
+            // A proof whose own input fee is at least its value adds nothing spendable
+            // (only on keysets charging >= 1000 ppk); taking it only raises the fee (CW-10).
+            if (intdiv($this->getInputFeePpk($proof->id), 1000) >= $proof->amount) {
+                continue;
             }
             $selected[] = $proof;
             $sum += $proof->amount;
@@ -9189,19 +9494,7 @@ class Wallet
     private function unblindRestoredSignature(array $blinded, array $signature): Proof
     {
         $pubkey = $this->getPublicKey($signature['id'], $signature['amount']);
-        $dleq = null;
-        if (isset($signature['dleq'])) {
-            // NUT-12: when the mint includes a DLEQ proof, wallets MUST verify it.
-            if (!Crypto::verifyDleq($signature['dleq']['e'], $signature['dleq']['s'], $pubkey,
-                $blinded['B_'], $signature['C_'])) {
-                throw new CashuException('Mint returned an invalid DLEQ proof for a restored signature');
-            }
-            $dleq = new DLEQWallet(
-                $signature['dleq']['e'],
-                $signature['dleq']['s'],
-                Secp256k1::scalarToHex($blinded['r'])
-            );
-        }
+        $dleq = self::verifiedSignatureDleq($signature, $pubkey, $blinded['B_'], $blinded['r'], 'a restored signature');
         return new Proof(
             $signature['id'],
             $signature['amount'],
@@ -9515,7 +9808,8 @@ class Wallet
     }
 
     /** Ensure keys of a keyset being scanned are loaded; returns an error message or null. */
-    private function loadRestoreKeys(string $keysetId): ?string
+    /** @param array $meta The keyset's /keysets entry (unit, input_fee_ppk, final_expiry) */
+    private function loadRestoreKeys(string $keysetId, array $meta = []): ?string
     {
         if (isset($this->keys[$keysetId])) {
             return null;
@@ -9530,7 +9824,14 @@ class Wallet
         }
         foreach ($keysResponse['keysets'] ?? [] as $keysetData) {
             if (is_array($keysetData) && ($keysetData['id'] ?? null) === $keysetId) {
-                [$keys] = self::partitionKeysetKeys(is_array($keysetData['keys'] ?? null) ? $keysetData['keys'] : []);
+                [$keys, $rawKeys] = self::partitionKeysetKeys(is_array($keysetData['keys'] ?? null) ? $keysetData['keys'] : []);
+                // NUT-02: a V2 ID commits to its keys and to the /keysets metadata. Keys
+                // that do not derive to it would unblind restored signatures into junk
+                // (CW-06); the keyset then stays unscanned and the wallet not ready.
+                $error = self::v2KeysetIdError($keysetId, $meta + $keysetData, $rawKeys);
+                if ($error !== null) {
+                    return $error;
+                }
                 $this->keys[$keysetId] = $keys;
             }
         }
@@ -9563,6 +9864,7 @@ class Wallet
             throw new CashuException('Mint did not return a keyset list; cannot restore safely');
         }
         $plan = [];
+        $meta = [];
         $skipped = [];
         foreach ($keysetsResponse['keysets'] as $ks) {
             if (!is_array($ks) || !is_string($ks['id'] ?? null) || $ks['id'] === '') {
@@ -9579,6 +9881,7 @@ class Wallet
                 continue;
             }
             $plan[$ks['id']] = $unit;
+            $meta[$ks['id']] = $ks + ['unit' => $unit];
         }
         if (empty($plan)) {
             // Nothing to scan proves nothing: fail closed rather than ready counter 0.
@@ -9612,7 +9915,7 @@ class Wallet
             if ($budgetExhausted) {
                 break;
             }
-            $keyError = $this->loadRestoreKeys($keysetId);
+            $keyError = $this->loadRestoreKeys($keysetId, $meta[$keysetId] ?? []);
             if ($keyError !== null) {
                 $failed[$keysetId] = $keyError;
                 continue;
@@ -9970,7 +10273,8 @@ class Wallet
      * @param string $address Lightning address (user@domain)
      * @param int $amountSats Amount in satoshis to pay
      * @param string|null $comment Optional comment (if supported by receiver)
-     * @return array{paid: bool, preimage: ?string, amount: int, fee: int, change: Proof[]}
+     * @return array{paid: bool, preimage: ?string, amount: int, fee: int, quote: string, change: Proof[],
+     *               changeRecoveryPending: bool, changeRecoveryError?: string}
      * @throws CashuException If payment fails
      */
     public function payToLightningAddress(string $address, int $amountSats, ?string $comment = null): array
@@ -10029,14 +10333,22 @@ class Wallet
         $changeAmount = self::sumProofs($result['change'] ?? []);
         $actualFee = $inputAmount - $changeAmount - $meltQuote->amount;
 
-        return [
+        // While the change is still at the mint (changeRecoveryPending), 'change' is empty
+        // and 'fee' counts the unrecovered change too: an upper bound, not the final
+        // figure. recoverPendingMelts() collects the change later (CPS-10).
+        $out = [
             'paid' => true,
             'preimage' => $result['preimage'],
             'amount' => $meltQuote->amount,
             'fee' => $actualFee,
             'quote' => $meltQuote->quote,
             'change' => $result['change'],
+            'changeRecoveryPending' => !empty($result['changeRecoveryPending']),
         ];
+        if (isset($result['changeRecoveryError'])) {
+            $out['changeRecoveryError'] = $result['changeRecoveryError'];
+        }
+        return $out;
     }
 }
 

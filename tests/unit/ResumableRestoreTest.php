@@ -34,7 +34,8 @@ final class ResumableRestoreTest extends TestCase
     protected function setUp(): void
     {
         $this->db = sys_get_temp_dir() . '/cashu-resumable-' . bin2hex(random_bytes(8)) . '.sqlite';
-        $this->v2 = '01' . str_repeat('ab', 32);
+        // A V2 ID that really derives from the fake mint's keys: restore verifies it (CW-06).
+        $this->v2 = Keyset::deriveKeysetIdV2(FakeRestoreMint::keys(), 'sat');
         $this->seed = new Wallet(self::MINT);
         $this->seed->initFromMnemonic(self::MNEMONIC);
     }
@@ -551,7 +552,7 @@ final class ResumableRestoreTest extends TestCase
     /** Keysets of every unit are scanned; each unit's proofs land in its own namespace. */
     public function testAllUnitsAreRecoveredAndReadiedTogether(): void
     {
-        $usd = '01' . str_repeat('cd', 32);
+        $usd = Keyset::deriveKeysetIdV2(FakeRestoreMint::keys(), 'usd');
         $mint = $this->mint(['sat' => null, 'usd' => $usd]);
         $mint->sign($this->seed, $this->v2, 0, 2);
         $mint->sign($this->seed, $usd, 5, 64);
@@ -568,7 +569,7 @@ final class ResumableRestoreTest extends TestCase
     /** Another seed's namespace is never written into. */
     public function testSiblingNamespaceOfAnotherSeedIsNotTouched(): void
     {
-        $usd = '01' . str_repeat('cd', 32);
+        $usd = Keyset::deriveKeysetIdV2(FakeRestoreMint::keys(), 'usd');
         $mint = $this->mint(['sat' => null, 'usd' => $usd]);
         $mint->sign($this->seed, $usd, 0, 64);
         $this->wallet($mint, 'new', 'usd', self::OTHER);

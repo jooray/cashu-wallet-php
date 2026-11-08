@@ -169,7 +169,10 @@ final class JournalTerminationTest extends TestCase
         $this->assertSame(1, $result['double_spent']);
         $this->assertSame(0, $result['still_pending']);
         $this->assertSame([], $wallet->getStorage()->getPendingOperations());
-        $this->assertSame(ProofState::SPENT, $wallet->getStorage()->getProofsStatesBySecrets([$token[0]->secret])[$token[0]->secret]);
+        // The token was never ours: no row is left, in particular no SPENT one that
+        // would read as a completed receive (CPS-01/CW-02).
+        $this->assertSame([], $wallet->getStorage()->getProofsStatesBySecrets([$token[0]->secret]));
+        $this->assertSame(0, $this->rowCount($wallet));
         $this->assertSame(0, $wallet->getBalance());
     }
 
@@ -294,6 +297,29 @@ final class JournalTerminationTest extends TestCase
         $this->assertSame(2, $wallet->getStorage()->getCounter(self::KS), 'old plan counters stay burned');
         $this->assertSame(2, $wallet->getStorage()->getCounter(self::NEW_KS));
         $this->assertSame(5, $wallet->getBalance());
+    }
+
+    /** A mint refusing every plan of a paid quote must not burn counters forever. */
+    public function testMintReplansAreCapped(): void
+    {
+        $wallet = $this->wallet();
+        $this->mint->onGet = fn(string $path) => $path === 'mint/quote/bolt11/q'
+            ? ['quote' => 'q', 'request' => 'lnbc', 'state' => 'PAID'] : null;
+        $this->mint->onPost = fn(string $path) => $path === 'mint/bolt11'
+            ? throw self::rejection(CashuProtocolException::KEYSET_INACTIVE, 'keyset inactive') : null;
+
+        for ($tick = 0; $tick < 10; $tick++) {
+            try {
+                $wallet->mint('q', 5);
+                $this->fail('refused quote issued');
+            } catch (CashuException $e) {
+            }
+        }
+        $plan = $wallet->getStorage()->getPendingOperationById('mint:q')['data'];
+        $this->assertCount(Wallet::MAX_MINT_REPLANS, $plan['replaced_plans']);
+        $this->assertSame(2 * (Wallet::MAX_MINT_REPLANS + 1), $wallet->getStorage()->getCounter(self::KS),
+            'only the capped number of plans burned counters');
+        $this->assertStringContainsString('journal retained', $e->getMessage());
     }
 
     public function testMintPlanIsKeptOnAmbiguousFailureOrWhenOutputsWereSigned(): void

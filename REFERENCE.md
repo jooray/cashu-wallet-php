@@ -444,6 +444,7 @@ Bring swap journals (from `swap()`, `split()`, `receive()`) to a terminal state.
 | inputs SPENT, all recorded outputs signed | outputs stored — `recovered` |
 | inputs UNSPENT, nothing signed | recorded plan resubmitted; if the mint definitively rejects it, inputs released and the plan's counters given back if nothing was allocated after them — `released` |
 | some or all inputs SPENT, none of our outputs signed | someone else spent them (e.g. a double-spent received token): SPENT inputs marked SPENT, UNSPENT ones released — `double_spent` |
+| (either of the last two, for inputs the journal imported — a received token) | those rows are deleted, never kept as SPENT or UNSPENT: they were never this wallet's |
 | any input PENDING, some outputs signed, unreadable answer, transport error | journal kept — `still_pending` / `errors` |
 | inputs PENDING at the mint for over `Wallet::SWAP_PENDING_WARN_AFTER` (1 h) | still kept, also counted in `aged_pending` with a `warnings` entry |
 | inputs no longer PENDING locally (someone overwrote them, e.g. with `updateProofsState()`) | journal cannot be finalized; `orphaned` + an `errors` entry naming the states; the mint is not asked |
@@ -512,7 +513,12 @@ Pay to a Lightning address using stored proofs. Combines LNURL-pay resolution wi
 - `$amountSats`: Amount in satoshis to pay
 - `$comment`: Optional payment comment (if supported by receiver)
 
-**Returns:** `array{paid: bool, preimage: ?string, amount: int, fee: int, change: Proof[]}`
+**Returns:** `array{paid: bool, preimage: ?string, amount: int, fee: int, quote: string, change: Proof[], changeRecoveryPending: bool, changeRecoveryError?: string}`
+
+`changeRecoveryPending` (as in `melt()`): the payment went out but the change could not be
+collected or recorded yet. `change` is then empty and `fee` is an upper bound that still
+includes the uncollected change; the melt journal is kept and `recoverPendingMelts()`
+stores the change later.
 
 **Throws:**
 - `CashuException` if storage is not configured
@@ -584,7 +590,11 @@ Split proofs to send a specific amount.
 
 **Returns:** `array{send: Proof[], keep: Proof[], fee: int}`
 
-**Throws:** `InsufficientBalanceException` if not enough balance.
+Outputs are sent to the mint in ascending amount order (NUT-03), so the order does not
+reveal which part is sent and which kept.
+
+**Throws:** `InsufficientBalanceException` if not enough balance; `CashuException` if
+`$amount <= 0`.
 
 **Example:**
 ```php
@@ -1206,8 +1216,8 @@ class MintQuote
 
 ```php
 public static function fromArray(array $data): self;
-public function isPaid(): bool;    // state === 'PAID'
-public function isIssued(): bool;  // state === 'ISSUED'
+public function isPaid(): bool;    // amount_paid - amount_issued >= amount (else state === 'PAID')
+public function isIssued(): bool;  // amount_issued > 0 and >= amount_paid (else state === 'ISSUED')
 ```
 
 ---

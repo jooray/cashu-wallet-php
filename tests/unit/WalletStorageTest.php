@@ -411,7 +411,9 @@ final class WalletStorageTest extends TestCase
                 $this->fail('Invalid owner accepted');
             } catch (CashuException $e) {
                 $this->assertNotNull($storage->getPendingOperationById('swap:q'));
-                $this->assertSame([], $storage->getProofsStatesBySecrets(['out']));
+                // The journal is not finalized, but outputs the mint signed are never
+                // dropped (CW-03): they are stored, and a later finalization finds them.
+                $this->assertSame(['out' => ProofState::UNSPENT], $storage->getProofsStatesBySecrets(['out']));
             }
         }
     }
