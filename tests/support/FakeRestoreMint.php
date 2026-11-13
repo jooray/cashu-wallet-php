@@ -51,7 +51,7 @@ final class FakeRestoreMint extends MintClient
         return $keys;
     }
 
-    public function get(string $path): array
+    public function get(string $path, ?int $timeout = null): array
     {
         $this->calls[] = ['GET', $path];
         if ($this->onGet !== null && ($answer = ($this->onGet)($path)) !== null) {

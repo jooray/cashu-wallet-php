@@ -28,6 +28,9 @@ final class MintClientHttpTest extends TestCase
         mkdir(self::$docroot);
         file_put_contents(self::$docroot . '/router.php', <<<'PHP'
 <?php
+if (str_contains($_SERVER['REQUEST_URI'], '/slow/')) {
+    sleep(3);
+}
 header('Content-Type: application/json');
 echo json_encode([
     'method' => $_SERVER['REQUEST_METHOD'],
@@ -99,5 +102,94 @@ PHP);
         $post = $client->post('checkstate', ['Ys' => ['02ab']]);
         $this->assertSame('POST', $post['method']);
         $this->assertSame(['Ys' => ['02ab']], $post['body']);
+    }
+
+    public function testPerCallTimeoutOverridesTheClientDefault(): void
+    {
+        if (self::$server === null) {
+            $this->markTestSkipped('Could not start the PHP built-in web server');
+        }
+        // Default 30 s; only this call is cut short (a background sweep on a dead mint).
+        $client = new MintClient('http://127.0.0.1:' . self::$port . '/slow/', 30);
+        $t0 = microtime(true);
+        try {
+            $client->get('melt/quote/bolt11/q', 1);
+            $this->fail('A 1 s timeout must abort a 3 s answer');
+        } catch (\Cashu\CashuException $e) {
+            $this->assertStringStartsWith('HTTP request failed', $e->getMessage());
+        }
+        $this->assertLessThan(2.5, microtime(true) - $t0);
+
+        $t0 = microtime(true);
+        try {
+            $client->post('checkstate', ['Ys' => ['02ab']], 1);
+            $this->fail('A 1 s timeout must abort a 3 s answer');
+        } catch (\Cashu\CashuException $e) {
+            $this->assertStringStartsWith('HTTP request failed', $e->getMessage());
+        }
+        $this->assertLessThan(2.5, microtime(true) - $t0);
+
+        // Without an override the client's own timeout still applies.
+        $this->assertSame('GET', $client->get('keysets')['method']);
+    }
+
+    public function testWithTimeoutAppliesOnlyInsideTheCallback(): void
+    {
+        if (self::$server === null) {
+            $this->markTestSkipped('Could not start the PHP built-in web server');
+        }
+        $url = 'http://127.0.0.1:' . self::$port . '/slow/';
+        $t0 = microtime(true);
+        $caught = MintClient::withTimeout(1, function () use ($url) {
+            try {
+                // Created inside the scope with the 30 s default, as Wallet does.
+                (new MintClient($url, 30))->get('info');
+                return null;
+            } catch (\Cashu\CashuException $e) {
+                return $e->getMessage();
+            }
+        });
+        $this->assertNotNull($caught);
+        $this->assertStringStartsWith('HTTP request failed', $caught);
+        $this->assertLessThan(2.5, microtime(true) - $t0);
+
+        // Restored afterwards, also when the callback throws.
+        try {
+            MintClient::withTimeout(1, fn() => throw new \RuntimeException('boom'));
+        } catch (\RuntimeException $e) {
+        }
+        $this->assertNull((new \ReflectionProperty(MintClient::class, 'scopedTimeout'))->getValue());
+    }
+
+    public function testWalletPassesPerCallTimeoutToItsClient(): void
+    {
+        $seen = [];
+        $client = new class ('https://mint.example', $seen) extends MintClient {
+            private array $seen;
+            public function __construct(string $url, array &$seen)
+            {
+                parent::__construct($url);
+                $this->seen = &$seen;
+            }
+            public function get(string $path, ?int $timeout = null): array
+            {
+                $this->seen[] = ['GET', $timeout];
+                return ['quote' => 'q', 'amount' => 1, 'fee_reserve' => 0, 'state' => 'PENDING'];
+            }
+            public function post(string $path, array $data, ?int $timeout = null): array
+            {
+                $this->seen[] = ['POST', $timeout];
+                return ['states' => array_map(fn($Y) => ['Y' => $Y, 'state' => 'SPENT'], $data['Ys'])];
+            }
+        };
+        $wallet = new \Cashu\Wallet('https://mint.example');
+        (new \ReflectionProperty(\Cashu\Wallet::class, 'client'))->setValue($wallet, $client);
+
+        $wallet->checkMeltQuote('q', 8);
+        $wallet->checkMeltQuote('q');
+        $proof = new \Cashu\Proof('00ad268c4d1f5826', 1, 'secret-1', '02' . str_repeat('ab', 32));
+        $wallet->checkProofState([$proof], 8);
+        $wallet->checkProofState([$proof]);
+        $this->assertSame([['GET', 8], ['GET', null], ['POST', 8], ['POST', null]], $seen);
     }
 }

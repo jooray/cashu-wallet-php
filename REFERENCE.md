@@ -339,13 +339,16 @@ echo "Amount: " . $quote->amount . ", Fee: " . $quote->feeReserve;
 #### checkMeltQuote()
 
 ```php
-public function checkMeltQuote(string $quoteId): MeltQuote
+public function checkMeltQuote(string $quoteId, ?int $timeout = null): MeltQuote
 ```
 
 Check status of a melt quote.
 
 **Parameters:**
 - `$quoteId`: Quote ID from `requestMeltQuote()`
+- `$timeout`: seconds for this request only (null: the client's 30 s). For a whole
+  sequence of calls, including wallet loading, use `MintClient::withTimeout($seconds, fn)`:
+  every request without its own timeout uses `$seconds` while `fn` runs.
 
 **Returns:** Updated `MeltQuote`.
 
@@ -718,13 +721,14 @@ $freshProofs = $wallet->receive($wallet->serializeToken($proofs));
 #### checkProofState()
 
 ```php
-public function checkProofState(array $proofs): array
+public function checkProofState(array $proofs, ?int $timeout = null): array
 ```
 
 Check the spent/pending state of proofs (NUT-07).
 
 **Parameters:**
 - `$proofs`: `Proof[]` to check
+- `$timeout`: seconds for each checkstate request (null: the client's 30 s)
 
 **Returns:** `list<array{Y: string, state: string, witness: mixed}>` — one entry per input
 proof, **in input order** (so `$states[$i]` belongs to `$proofs[$i]`). The mint's answer is

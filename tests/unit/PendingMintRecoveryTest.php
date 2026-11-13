@@ -51,7 +51,7 @@ final class PendingMintRecoveryTest extends TestCase
                 $this->onPost = $onPost;
             }
 
-            public function get(string $path): array
+            public function get(string $path, ?int $timeout = null): array
             {
                 return ($this->onGet)($path);
             }

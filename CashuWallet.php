@@ -3764,6 +3764,9 @@ class MintClient
     /** Process-wide default for $requireHttps (off: plain http mints keep working). */
     private static bool $requireHttpsDefault = false;
 
+    /** Timeout set by withTimeout() for every client while its callback runs; null: none. */
+    private static ?int $scopedTimeout = null;
+
     /**
      * @param bool|null $requireHttps Refuse plain http unless the host is loopback
      *        (proofs would cross the network in cleartext). Null: setRequireHttps().
@@ -3781,6 +3784,28 @@ class MintClient
     public static function setRequireHttps(bool $require): void
     {
         self::$requireHttpsDefault = $require;
+    }
+
+    /**
+     * Run $fn with $seconds as the timeout of every mint request that does not set its
+     * own, on every client (including those Wallet creates or loadMint() uses). Meant
+     * for background sweeps where one mint that never answers must not eat the budget;
+     * defaults are untouched outside the callback. Explicit per-call timeouts (e.g. the
+     * long melt request) still win.
+     *
+     * @template T
+     * @param callable(): T $fn
+     * @return T
+     */
+    public static function withTimeout(int $seconds, callable $fn): mixed
+    {
+        $previous = self::$scopedTimeout;
+        self::$scopedTimeout = max(1, $seconds);
+        try {
+            return $fn();
+        } finally {
+            self::$scopedTimeout = $previous;
+        }
     }
 
     /** https, or http to localhost / 127.0.0.0/8 / ::1. */
@@ -3862,14 +3887,18 @@ class MintClient
 
     /**
      * Make a GET request
+     *
+     * @param int|null $timeout Seconds for this request only; null: the client's timeout
      */
-    public function get(string $path): array
+    public function get(string $path, ?int $timeout = null): array
     {
-        return $this->request('GET', $path);
+        return $this->request('GET', $path, null, $timeout);
     }
 
     /**
      * Make a POST request
+     *
+     * @param int|null $timeout Seconds for this request only; null: the client's timeout
      */
     public function post(string $path, array $data, ?int $timeout = null): array
     {
@@ -3893,7 +3922,7 @@ class MintClient
             CURLOPT_RETURNTRANSFER => true,
             // A redirect target would bypass the scheme check and the connect guard.
             CURLOPT_FOLLOWLOCATION => false,
-            CURLOPT_TIMEOUT => $timeout ?? $this->timeout,
+            CURLOPT_TIMEOUT => $timeout ?? self::$scopedTimeout ?? $this->timeout,
             CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
@@ -8011,11 +8040,14 @@ class Wallet
 
     /**
      * Check the status of a melt quote
+     *
+     * @param int|null $timeout Seconds for this request only (e.g. a background sweep
+     *        that must not wait 30 s on a dead mint); null: the default timeout
      */
-    public function checkMeltQuote(string $quoteId): MeltQuote
+    public function checkMeltQuote(string $quoteId, ?int $timeout = null): MeltQuote
     {
         // The id comes from the mint (or a stored journal): never let it change the path.
-        $response = $this->client->get('melt/quote/bolt11/' . rawurlencode($quoteId));
+        $response = $this->client->get('melt/quote/bolt11/' . rawurlencode($quoteId), $timeout);
         return MeltQuote::fromArray($response);
     }
 
@@ -8743,15 +8775,16 @@ class Wallet
      * @return list<array{Y: string, state: string, witness: mixed}> One entry per input
      *         proof, in input order. `state` is upper-case; ProofState::UNKNOWN when the
      *         mint sent none — never read that as UNSPENT.
+     * @param int|null $timeout Seconds for each checkstate request; null: the default timeout
      * @throws CashuException on a short, reordered-with-wrong-Y or duplicated answer
      */
-    public function checkProofState(array $proofs): array
+    public function checkProofState(array $proofs, ?int $timeout = null): array
     {
         if (empty($proofs)) {
             return [];
         }
         $Ys = array_map(fn(Proof $p) => strtolower($p->Y), array_values($proofs));
-        $entries = $this->fetchStateEntriesByY($Ys);
+        $entries = $this->fetchStateEntriesByY($Ys, $timeout);
         $result = [];
         foreach ($Ys as $Y) {
             $entry = $entries[$Y];
@@ -9617,12 +9650,12 @@ class Wallet
      *
      * @return array<string, array{Y: string, state: string, witness: mixed}>
      */
-    private function fetchStateEntriesByY(array $Ys): array
+    private function fetchStateEntriesByY(array $Ys, ?int $timeout = null): array
     {
         $result = [];
         $Ys = array_values(array_unique(array_map('strtolower', $Ys)));
         foreach (array_chunk($Ys, $this->maxArrayLength()) as $chunk) {
-            $response = $this->client->post('checkstate', ['Ys' => $chunk]);
+            $response = $this->client->post('checkstate', ['Ys' => $chunk], $timeout);
             $states = $response['states'] ?? null;
             if (!is_array($states) || count($states) !== count($chunk)) {
                 throw new CashuException('Mint returned an incomplete proof state response');
