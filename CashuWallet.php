@@ -3761,10 +3761,38 @@ class MintClient
     private string $mintUrl;
     private int $timeout;
 
-    public function __construct(string $mintUrl, int $timeout = 30)
+    /** Process-wide default for $requireHttps (off: plain http mints keep working). */
+    private static bool $requireHttpsDefault = false;
+
+    /**
+     * @param bool|null $requireHttps Refuse plain http unless the host is loopback
+     *        (proofs would cross the network in cleartext). Null: setRequireHttps().
+     */
+    public function __construct(string $mintUrl, int $timeout = 30, ?bool $requireHttps = null)
     {
         $this->mintUrl = self::canonicalizeMintUrl($mintUrl);
         $this->timeout = $timeout;
+        if (($requireHttps ?? self::$requireHttpsDefault) && !self::isHttpsOrLoopback($this->mintUrl)) {
+            throw new CashuException('Mint URL must use https://');
+        }
+    }
+
+    /** Make every MintClient (including the one each Wallet creates) refuse plain http to non-loopback hosts. */
+    public static function setRequireHttps(bool $require): void
+    {
+        self::$requireHttpsDefault = $require;
+    }
+
+    /** https, or http to localhost / 127.0.0.0/8 / ::1. */
+    public static function isHttpsOrLoopback(string $mintUrl): bool
+    {
+        $parts = parse_url($mintUrl);
+        if (strtolower($parts['scheme'] ?? '') === 'https') {
+            return true;
+        }
+        $host = strtolower(trim($parts['host'] ?? '', '[]'));
+        return $host === 'localhost' || str_ends_with($host, '.localhost') || $host === '::1'
+            || (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false && str_starts_with($host, '127.'));
     }
 
     /**
@@ -4512,6 +4540,7 @@ class WalletStorage
                 'highest_signed' => $r['highest_signed'] === null ? null : (int)$r['highest_signed'],
                 'empty_run' => (int)$r['empty_run'],
                 'done' => (int)$r['done'] === 1,
+                'abandoned' => (int)$r['done'] === self::RESTORE_ABANDONED,
                 'error' => $r['last_error'],
                 'updated_at' => (int)$r['updated_at'],
             ];
@@ -4575,6 +4604,20 @@ class WalletStorage
             'INSERT INTO cashu_restore_progress (wallet_id, keyset_id, unit, updated_at)
              VALUES (?, ?, ?, ?) ON CONFLICT(wallet_id, keyset_id) DO NOTHING'
         )->execute([$this->walletId, $keysetId, $unit, time()]);
+    }
+
+    /** `done` value of a keyset the mint no longer knows; last_error holds the warning. */
+    public const RESTORE_ABANDONED = 2;
+
+    /**
+     * @internal Give up on a keyset the mint definitively no longer knows ($warning), or
+     * with null take that back (the mint lists it again).
+     */
+    public function abandonRestoreKeyset(string $keysetId, ?string $warning): void
+    {
+        $this->pdo->prepare(
+            'UPDATE cashu_restore_progress SET done = ?, last_error = ?, updated_at = ? WHERE wallet_id = ? AND keyset_id = ?'
+        )->execute([$warning === null ? 0 : self::RESTORE_ABANDONED, $warning, time(), $this->walletId, $keysetId]);
     }
 
     /** @internal Record the last error of the session (and optionally of one keyset). */
@@ -4770,11 +4813,26 @@ class WalletStorage
             }
             $gap = (int)($row['restore_gap'] ?? 0);
             $check = $this->pdo->prepare(
-                'SELECT empty_run, last_error FROM cashu_restore_progress WHERE wallet_id = ? AND keyset_id = ?'
+                'SELECT empty_run, done, last_error FROM cashu_restore_progress WHERE wallet_id = ? AND keyset_id = ?'
             );
+            // Also every keyset this session started in these units, even one the mint
+            // stopped listing: its counters are as much this seed's history.
+            $units = array_values(array_unique(array_merge([$this->unit], $siblingUnits)));
+            $started = $this->pdo->prepare(
+                'SELECT keyset_id FROM cashu_restore_progress WHERE wallet_id = ? AND unit IN ('
+                . implode(',', array_fill(0, count($units), '?')) . ')'
+            );
+            $started->execute(array_merge([$this->walletId], $units));
+            $keysetIds = array_values(array_unique(array_merge(
+                array_map('strval', $keysetIds),
+                array_map('strval', $started->fetchAll(\PDO::FETCH_COLUMN))
+            )));
             foreach ($keysetIds as $keysetId) {
                 $check->execute([$this->walletId, $keysetId]);
                 $progress = $check->fetch(\PDO::FETCH_ASSOC);
+                if ($progress !== false && (int)$progress['done'] === self::RESTORE_ABANDONED) {
+                    continue;
+                }
                 if ($gap < 1 || $progress === false || (int)$progress['empty_run'] < $gap
                     || $progress['last_error'] !== null) {
                     throw new CashuException('Restore scan is not complete');
@@ -5412,12 +5470,19 @@ class WalletStorage
         }
     }
 
-    /** Atomically persist outputs, transition inputs, and remove the journal. */
+    /**
+     * Atomically persist outputs, transition inputs, and remove the journal.
+     *
+     * $spendOrphanedInputs: the caller knows the mint consumed the inputs (a PAID melt).
+     * If the journal is already gone, inputs still UNSPENT locally are marked SPENT so
+     * they are not offered again; inputs reserved by another operation are left to it.
+     */
     public function finalizePendingSpend(
         string $id,
         array $inputSecrets,
         string $inputState,
-        array $outputProofs = []
+        array $outputProofs = [],
+        bool $spendOrphanedInputs = false
     ): void {
         $savepoint = $this->beginWrite();
         try {
@@ -5426,6 +5491,9 @@ class WalletStorage
                 // A completed/deleted journal no longer owns any inputs. Outputs the mint
                 // signed for us are still ours, though: keep them (CW-03; idempotent).
                 $this->storeProofs($outputProofs);
+                if ($spendOrphanedInputs && $inputState === ProofState::SPENT) {
+                    $this->transitionProofStates($inputSecrets, ProofState::SPENT, [ProofState::UNSPENT]);
+                }
                 $this->commitWrite($savepoint);
                 return;
             }
@@ -6255,10 +6323,9 @@ class Wallet
      * Checks all pending melt operations against the mint and updates
      * proof states accordingly:
      * - PAID: Mark input proofs as SPENT, recover change proofs, delete pending op
-     * - UNPAID + expired: Mark input proofs as UNSPENT, delete pending op
-     * - PENDING or UNPAID + not expired: Keep as-is for next check
-     * - UNPAID without expiry: released like an expired one once the journal is older
-     *   than MELT_RELEASE_AFTER and the mint confirms the inputs UNSPENT
+     * - UNPAID + expired (or without expiry), journal older than MELT_RELEASE_AFTER and
+     *   the mint confirms the inputs UNSPENT: mark them UNSPENT, delete pending op
+     * - PENDING or UNPAID otherwise: Keep as-is for next check
      * - Quote unknown to the mint (`unknown_quote`): inputs UNSPENT → restored; SPENT →
      *   change via NUT-09, then paid; otherwise kept
      * - PAID with change that can never be unblinded: finalized anyway (inputs SPENT),
@@ -6371,11 +6438,13 @@ class Wallet
                 } elseif ($state === 'UNPAID') {
                     // Check if quote has expired
                     $now = time();
-                    // A quote without an expiry never "expires"; once our melt request
-                    // can no longer be in flight, the inputs' state decides instead.
-                    $expired = $quote->expiry !== null
-                        ? $quote->expiry < $now
-                        : (int)($op['created_at'] ?? $now) < $now - self::MELT_RELEASE_AFTER;
+                    // Release only once our melt request can no longer be in flight: a
+                    // short-lived quote may expire while the POST is still being worked
+                    // on, and a mint that reports UNPAID during that time would otherwise
+                    // get our inputs back here and spend them there. A quote without an
+                    // expiry never "expires"; the journal's age and the inputs' state decide.
+                    $inFlightOver = (int)($op['created_at'] ?? $now) < $now - self::MELT_RELEASE_AFTER;
+                    $expired = $inFlightOver && ($quote->expiry === null || $quote->expiry < $now);
 
                     if ($expired && $this->inputsConfirmedUnspent($op['data']['input_secrets'] ?? [])) {
                         // An expired unpaid quote is necessary but not sufficient to hand
@@ -6405,8 +6474,9 @@ class Wallet
     }
 
     /**
-     * Seconds after which a melt journal on an UNPAID quote without expiry may release
-     * its inputs (after the mint confirms them UNSPENT). Well past melt()'s 120 s request.
+     * Seconds after which a melt journal on an UNPAID quote (expired, or without expiry)
+     * may release its inputs (after the mint confirms them UNSPENT). Well past melt()'s
+     * 120 s request.
      */
     public const MELT_RELEASE_AFTER = 600;
 
@@ -7461,7 +7531,15 @@ class Wallet
         if ($quote->unit !== null && strtolower($quote->unit) !== strtolower($this->unit)) {
             throw new CashuException("Mint quote is denominated in {$quote->unit}, not {$this->unit}");
         }
+        // The invoice ends up in a QR code and on the payment page: refuse what no real
+        // BOLT11 invoice looks like (oversized, or outside bech32) before showing it.
+        if (strlen($quote->request) > self::MAX_INVOICE_LENGTH) {
+            throw new CashuException('Mint quote contains an oversized Lightning invoice');
+        }
         $invoice = preg_replace('/^lightning:/i', '', trim($quote->request));
+        if (!Bolt11::looksLikeBech32($invoice)) {
+            throw new CashuException('Mint quote does not contain a valid Lightning invoice');
+        }
         $invoiceSats = Bolt11::amountSats($invoice);
         if ($invoiceSats <= 0) {
             throw new CashuException('Mint quote does not contain a Lightning invoice with an amount');
@@ -7470,6 +7548,9 @@ class Wallet
             throw new CashuException("Mint invoice is for {$invoiceSats} sat, requested {$amount}");
         }
     }
+
+    /** Longest mint-quote invoice accepted (real BOLT11 invoices are far shorter). */
+    public const MAX_INVOICE_LENGTH = 4096;
 
     /** Sentinel counter id (not a keyset) for NUT-20 quote locking keys. */
     private const NUT20_COUNTER_ID = '_nut20_quote_keys';
@@ -8127,6 +8208,19 @@ class Wallet
         // through NUT-09 and finalizes it later.
         try {
             $changeProofs = $this->unblindMeltChange($response['change'] ?? [], $blindingData, $keysetId);
+            // The overpayment beyond the fee reserve is always refunded; only the reserve
+            // itself may be consumed by Lightning fees. A response with no change, or less
+            // than that guaranteed part, is short (broken or hostile mint): ask the mint
+            // via NUT-09 which of our blank outputs it signed and keep the larger result.
+            // A complete response costs no extra request.
+            $guaranteedChange = max(0, $maxChange - $quote->feeReserve);
+            if (!empty($changeAmounts)
+                && ($changeProofs === [] || self::sumProofs($changeProofs) < $guaranteedChange)) {
+                $restored = $this->recoverPendingOutputs($pendingData, false);
+                if (self::sumProofs($restored) > self::sumProofs($changeProofs)) {
+                    $changeProofs = $restored;
+                }
+            }
         } catch (\Throwable $changeError) {
             return [
                 'paid' => true,
@@ -8148,7 +8242,9 @@ class Wallet
     private function finalizePaidMelt(string $pendingId, array $inputSecrets, array $changeProofs, ?string $preimage): array
     {
         try {
-            $this->storage->finalizePendingSpend($pendingId, $inputSecrets, ProofState::SPENT, $changeProofs);
+            // The mint says PAID, so the inputs are spent even if recovery already
+            // released this journal (e.g. while our POST was still in flight).
+            $this->storage->finalizePendingSpend($pendingId, $inputSecrets, ProofState::SPENT, $changeProofs, true);
         } catch (\Throwable $finalizeError) {
             return [
                 'paid' => true,
@@ -9684,15 +9780,21 @@ class Wallet
      * @return array{
      *   status: string,
      *   progress: array<string, array{unit: string, nextCounter: int, highestSigned: ?int,
-     *                                 emptyRun: int, done: bool, error: ?string}>,
+     *                                 emptyRun: int, done: bool, abandoned: bool, error: ?string,
+     *                                 warning: ?string}>,
      *   error: ?string,
      *   errors: array<string, string>,
      *   recovered: array{outputs: int, proofs: int, unspent: int, amount: int, spent: int,
      *                    unknown: int, zeroAmount: int},
      *   skippedKeysets: string[],
+     *   abandonedKeysets: array<string, string>,
      *   gap: int,
      *   ready: bool
-     * } status is 'pending' (call again), 'complete' (ready) or 'error' (retry later)
+     * } status is 'pending' (call again), 'complete' (ready) or 'error' (retry later).
+     *   A keyset this session started is scanned even after the mint stops listing it;
+     *   if the mint then says it does not know it at all, it is skipped and listed in
+     *   abandonedKeysets (keyset id => warning; funds left on it are lost), so the
+     *   restore can still complete. Show that warning to the operator.
      */
     public function restoreStep(int $maxOutputs = 100, ?float $deadline = null, int $gap = self::RESTORE_GAP): array
     {
@@ -9715,6 +9817,7 @@ class Wallet
                 'errors' => ['mint' => $e->getMessage()],
                 'recovered' => $collect['recovered'],
                 'skippedKeysets' => [],
+                'abandonedKeysets' => $status['abandonedKeysets'],
                 'gap' => $status['gap'],
                 'ready' => $status['ready'],
             ];
@@ -9749,6 +9852,7 @@ class Wallet
             'status' => $status,
             'ready' => $this->hasSeed() ? !$this->requiresRecovery() : (bool)($provenance['ready'] ?? false),
             'progress' => self::formatRestoreProgress($raw['keysets'], $gap),
+            'abandonedKeysets' => self::abandonedRestoreKeysets($raw['keysets']),
             'error' => $raw['error'],
             'gap' => $gap,
             'unknownProofs' => (int)$raw['unknown_proofs'],
@@ -9762,16 +9866,63 @@ class Wallet
     {
         $progress = [];
         foreach ($rows as $keysetId => $row) {
+            $abandoned = !empty($row['abandoned']);
             $progress[$keysetId] = [
                 'unit' => $row['unit'],
                 'nextCounter' => $row['next_counter'],
                 'highestSigned' => $row['highest_signed'],
                 'emptyRun' => $row['empty_run'],
-                'done' => $row['empty_run'] >= $gap,
-                'error' => $row['error'],
+                'done' => $abandoned || $row['empty_run'] >= $gap,
+                'abandoned' => $abandoned,
+                // An abandoned keyset's message is a warning, not an error to retry.
+                'error' => $abandoned ? null : $row['error'],
+                'warning' => $abandoned ? $row['error'] : null,
             ];
         }
         return $progress;
+    }
+
+    /**
+     * Keysets of the session the mint no longer knows, with why: anything this seed
+     * still held on them could not be restored. The app should tell the operator.
+     *
+     * @return array<string, string> keyset id => warning
+     */
+    private static function abandonedRestoreKeysets(array $rows): array
+    {
+        $abandoned = [];
+        foreach ($rows as $keysetId => $row) {
+            if (!empty($row['abandoned'])) {
+                $abandoned[(string)$keysetId] = (string)($row['error'] ?? 'The mint no longer knows this keyset');
+            }
+        }
+        return $abandoned;
+    }
+
+    /**
+     * The mint definitively does not know a keyset (NUT-02 code 12001, or HTTP 400/404/
+     * 410 on its own keys). Rate limits, auth, 5xx and transport failures do not count.
+     */
+    private static function isUnknownKeysetError(CashuException $e): bool
+    {
+        if (!$e instanceof CashuProtocolException || !$e->isDefinitive()) {
+            return false;
+        }
+        return $e->getCode() === CashuProtocolException::KEYSET_UNKNOWN
+            || in_array($e->getHttpStatus(), [400, 404, 410], true);
+    }
+
+    /** Stop scanning a keyset the mint no longer knows; see abandonedRestoreKeysets(). */
+    private function abandonRestoreKeyset(string $keysetId, string $reason, array &$rows): void
+    {
+        $warning = "The mint no longer knows keyset $keysetId, so anything left on it could not be restored: $reason";
+        $this->storage?->abandonRestoreKeyset($keysetId, $warning);
+        $rows[$keysetId]['abandoned'] = true;
+        $rows[$keysetId]['error'] = $warning;
+        if (!$this->storage && isset($this->memoryRestore['keysets'][$keysetId])) {
+            $this->memoryRestore['keysets'][$keysetId]['abandoned'] = true;
+            $this->memoryRestore['keysets'][$keysetId]['error'] = $warning;
+        }
     }
 
     private static function emptyRestoreCollection(): array
@@ -9809,8 +9960,9 @@ class Wallet
 
     /** Ensure keys of a keyset being scanned are loaded; returns an error message or null. */
     /** @param array $meta The keyset's /keysets entry (unit, input_fee_ppk, final_expiry) */
-    private function loadRestoreKeys(string $keysetId, array $meta = []): ?string
+    private function loadRestoreKeys(string $keysetId, array $meta = [], ?bool &$keysetUnknown = null): ?string
     {
+        $keysetUnknown = false;
         if (isset($this->keys[$keysetId])) {
             return null;
         }
@@ -9818,8 +9970,9 @@ class Wallet
             // URL-encode keyset ID in case it contains special characters like /
             $keysResponse = $this->client->get('keys/' . urlencode($keysetId));
         } catch (CashuException $e) {
-            // Old/deprecated keyset or a transient failure — we cannot tell them apart.
-            // Its counters stay unscanned, so the wallet must not become ready.
+            // A transient failure keeps its counters unscanned and the wallet not ready;
+            // $keysetUnknown tells the caller the mint definitively does not know it.
+            $keysetUnknown = self::isUnknownKeysetError($e);
             return $e->getMessage();
         }
         foreach ($keysResponse['keysets'] ?? [] as $keysetData) {
@@ -9892,6 +10045,14 @@ class Wallet
         $gap = $session['gap'];
         $rows = $session['rows'];
         foreach ($plan as $keysetId => $unit) {
+            if (!empty($rows[$keysetId]['abandoned'])) {
+                // Listed again after the mint had disowned it: scan it like any other.
+                $this->storage?->abandonRestoreKeyset($keysetId, null);
+                $rows[$keysetId] = ['abandoned' => false, 'error' => null] + $rows[$keysetId];
+                if (!$this->storage) {
+                    $this->memoryRestore['keysets'][$keysetId] = $rows[$keysetId];
+                }
+            }
             if (!isset($rows[$keysetId])) {
                 $this->storage?->ensureRestoreKeyset($keysetId, $unit);
                 $rows[$keysetId] = ['unit' => $unit, 'next_counter' => 0, 'highest_signed' => null,
@@ -9900,6 +10061,24 @@ class Wallet
                     $this->memoryRestore['keysets'][$keysetId] = $rows[$keysetId];
                 }
             }
+        }
+
+        // A keyset this session already started that the mint no longer lists may still
+        // hold counters this seed used: keep scanning it (keys via /keys/{id}) rather than
+        // completing without it. Only the mint saying it does not know the keyset at all
+        // ends that, as an abandoned keyset with a warning instead of a permanent block.
+        $orphans = [];
+        foreach ($rows as $keysetId => $row) {
+            $keysetId = (string)$keysetId;
+            if (isset($plan[$keysetId]) || !empty($row['abandoned'])
+                || ($row['empty_run'] >= $gap && $row['error'] === null)
+                || (!$allUnits && $row['unit'] !== $this->unit)
+                || !$this->canDeriveSecretsFor($keysetId)) {
+                continue;
+            }
+            $plan[$keysetId] = $row['unit'];
+            $meta[$keysetId] = ['unit' => $row['unit']];
+            $orphans[$keysetId] = true;
         }
 
         $fingerprint = $this->storage?->getSeedFingerprint();
@@ -9915,8 +10094,13 @@ class Wallet
             if ($budgetExhausted) {
                 break;
             }
-            $keyError = $this->loadRestoreKeys($keysetId, $meta[$keysetId] ?? []);
+            $keysetUnknown = false;
+            $keyError = $this->loadRestoreKeys($keysetId, $meta[$keysetId] ?? [], $keysetUnknown);
             if ($keyError !== null) {
+                if ($keysetUnknown && isset($orphans[$keysetId])) {
+                    $this->abandonRestoreKeyset($keysetId, $keyError, $rows);
+                    continue;
+                }
                 $failed[$keysetId] = $keyError;
                 continue;
             }
@@ -9933,6 +10117,10 @@ class Wallet
                 try {
                     $scan = $this->scanRestoreRange($keysetId, $from, $size, $deadline);
                 } catch (CashuException $e) {
+                    if (isset($orphans[$keysetId]) && self::isUnknownKeysetError($e)) {
+                        $this->abandonRestoreKeyset($keysetId, $e->getMessage(), $rows);
+                        break;
+                    }
                     // Mint error or a reply that failed validation: nothing from this
                     // batch is trusted or stored, and the keyset stays incomplete.
                     $failed[$keysetId] = $e->getMessage();
@@ -10021,7 +10209,7 @@ class Wallet
 
         $allDone = empty($failed);
         foreach ($plan as $keysetId => $unit) {
-            if ($rows[$keysetId]['empty_run'] < $gap) {
+            if ($rows[$keysetId]['empty_run'] < $gap && empty($rows[$keysetId]['abandoned'])) {
                 $allDone = false;
             }
         }
@@ -10064,6 +10252,7 @@ class Wallet
             'errors' => $collect['errors'],
             'recovered' => $collect['recovered'],
             'skippedKeysets' => $skipped,
+            'abandonedKeysets' => self::abandonedRestoreKeysets($rows),
             'gap' => $gap,
         ];
     }
@@ -10188,6 +10377,7 @@ class Wallet
             'counters' => $counters,
             'byUnit' => $byUnit,
             'skippedKeysets' => $step['skippedKeysets'],
+            'abandonedKeysets' => $step['abandonedKeysets'],
             'status' => $step['status'],
             'progress' => $step['progress'],
         ];
@@ -10587,6 +10777,18 @@ class LightningAddress
  */
 class Bolt11
 {
+    /**
+     * Shape check only (no checksum): "ln" + human-readable part, the "1" separator,
+     * then data in the bech32 charset, all in one case (BIP-173).
+     */
+    public static function looksLikeBech32(string $bolt11): bool
+    {
+        if ($bolt11 !== strtolower($bolt11) && $bolt11 !== strtoupper($bolt11)) {
+            return false;
+        }
+        return preg_match('/^ln[a-z0-9]+1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]+$/D', strtolower($bolt11)) === 1;
+    }
+
     /**
      * Amount encoded in a BOLT11 invoice, in satoshis.
      *

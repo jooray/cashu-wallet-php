@@ -598,7 +598,7 @@ final class ResumableRestoreTest extends TestCase
         $status = $wallet->getRestoreStatus();
         $this->assertSame('pending', $status['status']);
         $this->assertSame(['unit' => 'sat', 'nextCounter' => 3, 'highestSigned' => 2, 'emptyRun' => 0,
-            'done' => false, 'error' => null], $status['progress'][$this->v2]);
+            'done' => false, 'abandoned' => false, 'error' => null, 'warning' => null], $status['progress'][$this->v2]);
         $this->assertSame(WalletStorage::INIT_RESTORE_REQUIRED, $status['provenance']['init_reason']);
 
         // restore() resumes the session and keeps its historical return shape.
